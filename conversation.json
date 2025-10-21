@@ -1,0 +1,28 @@
+{
+  "user_id": "user_abc_123",
+  "session_id": "session_xyz_789",
+  "start_time": "2025-10-20T10:00:00Z",
+  "turns": [
+    {
+      "turn_id": "msg_001",
+      "role": "user",
+      "content": "Hey, how are you?",
+      "timestamp": "2025-10-20T10:00:00Z",
+      "consolidated": false
+    },
+    {
+      "turn_id": "msg_002",
+      "role": "assistant",
+      "content": "I'm doing well! What's on your mind?",
+      "timestamp": "2025-10-20T10:00:05Z",
+      "consolidated": false
+    },
+    {
+      "turn_id": "msg_003",
+      "role": "user",
+      "content": "I'm working on that Python script again...",
+      "timestamp": "2025-10-20T10:00:12Z",
+      "consolidated": false
+    }
+  ]
+}
