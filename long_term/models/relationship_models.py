@@ -24,18 +24,20 @@ class MemoryRelationshipType(str, Enum):
     RELATIONSHIP_TO_EXPERIENCE = "RELATIONSHIP_TO_EXPERIENCE"  # Person was in experience
     KNOWLEDGE_TO_RELATIONSHIP = "KNOWLEDGE_TO_RELATIONSHIP"  # Knowledge about person
     RELATIONSHIP_TO_KNOWLEDGE = "RELATIONSHIP_TO_KNOWLEDGE"  # Person has knowledge
-    CURRENT_TO_EXPERIENCE = "CURRENT_TO_EXPERIENCE"  # Current focus on experience
-    EXPERIENCE_TO_CURRENT = "EXPERIENCE_TO_CURRENT"  # Experience relevant to current
-    CURRENT_TO_KNOWLEDGE = "CURRENT_TO_KNOWLEDGE"  # Current focus on knowledge
-    KNOWLEDGE_TO_CURRENT = "KNOWLEDGE_TO_CURRENT"  # Knowledge relevant to current
-    CURRENT_TO_RELATIONSHIP = "CURRENT_TO_RELATIONSHIP"  # Current focus on person
-    RELATIONSHIP_TO_CURRENT = "RELATIONSHIP_TO_CURRENT"  # Person relevant to current
+    
+    # REFACTOR: Removed all 'CURRENT' relationships
+    # CURRENT_TO_EXPERIENCE = "CURRENT_TO_EXPERIENCE"
+    # EXPERIENCE_TO_CURRENT = "EXPERIENCE_TO_CURRENT"
+    # CURRENT_TO_KNOWLEDGE = "CURRENT_TO_KNOWLEDGE"
+    # KNOWLEDGE_TO_CURRENT = "KNOWLEDGE_TO_CURRENT"
+    # CURRENT_TO_RELATIONSHIP = "CURRENT_TO_RELATIONSHIP"
+    # RELATIONSHIP_TO_CURRENT = "RELATIONSHIP_TO_CURRENT"
     
     # Within-context relationships
     EXPERIENCE_CHAIN = "EXPERIENCE_CHAIN"  # One experience led to another
     KNOWLEDGE_HIERARCHY = "KNOWLEDGE_HIERARCHY"  # Knowledge builds on other knowledge
     RELATIONSHIP_NETWORK = "RELATIONSHIP_NETWORK"  # People know each other
-    CURRENT_SEQUENCE = "CURRENT_SEQUENCE"  # Current focus transitions
+    # REFACTOR: Removed 'CURRENT_SEQUENCE'
     
     # Temporal relationships
     HAPPENED_BEFORE = "HAPPENED_BEFORE"
@@ -145,18 +147,13 @@ MEMORY_RELATIONSHIP_TYPE_MAPPING = {
         MemoryRelationshipType.RELATIONSHIP_TO_EXPERIENCE,
         MemoryRelationshipType.KNOWLEDGE_TO_RELATIONSHIP,
         MemoryRelationshipType.RELATIONSHIP_TO_KNOWLEDGE,
-        MemoryRelationshipType.CURRENT_TO_EXPERIENCE,
-        MemoryRelationshipType.EXPERIENCE_TO_CURRENT,
-        MemoryRelationshipType.CURRENT_TO_KNOWLEDGE,
-        MemoryRelationshipType.KNOWLEDGE_TO_CURRENT,
-        MemoryRelationshipType.CURRENT_TO_RELATIONSHIP,
-        MemoryRelationshipType.RELATIONSHIP_TO_CURRENT
+        # REFACTOR: Removed all 'CURRENT' relationships
     ],
     MemoryRelationshipCategory.WITHIN_CONTEXT: [
         MemoryRelationshipType.EXPERIENCE_CHAIN,
         MemoryRelationshipType.KNOWLEDGE_HIERARCHY,
         MemoryRelationshipType.RELATIONSHIP_NETWORK,
-        MemoryRelationshipType.CURRENT_SEQUENCE
+        # REFACTOR: Removed 'CURRENT_SEQUENCE'
     ],
     MemoryRelationshipCategory.TEMPORAL: [
         MemoryRelationshipType.HAPPENED_BEFORE,

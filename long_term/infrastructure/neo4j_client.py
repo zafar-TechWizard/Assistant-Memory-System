@@ -105,18 +105,6 @@ class Neo4jClient:
     ) -> List[Dict[str, Any]]:
         """
         Execute a Cypher query with retry logic and error handling.
-        
-        Args:
-            query: Cypher query string
-            parameters: Query parameters
-            database: Database name (defaults to config database)
-            
-        Returns:
-            List of result records as dictionaries
-            
-        Raises:
-            DatabaseError: For database-related errors
-            ServiceUnavailable: For connection issues
         """
         if not self._is_connected:
             raise ConnectionError("Not connected to Neo4j database")
@@ -146,11 +134,6 @@ class Neo4jClient:
     async def transaction(self, database: Optional[str] = None):
         """
         Context manager for database transactions with automatic rollback on error.
-        
-        Usage:
-            async with client.transaction() as tx:
-                await tx.run("CREATE (n:Person {name: $name})", {"name": "John"})
-                await tx.run("CREATE (n:Person {name: $name})", {"name": "Jane"})
         """
         if not self._is_connected:
             raise ConnectionError("Not connected to Neo4j database")
@@ -171,12 +154,27 @@ class Neo4jClient:
     
     async def create_constraints_and_indexes(self) -> None:
         """Create necessary constraints and indexes for optimal performance"""
+        
+        # This is the fix for Gap #3.
+        vector_index_query = """
+        CREATE VECTOR INDEX memory_vector_index IF NOT EXISTS
+        FOR (n:ExperienceMemory|KnowledgeMemory|RelationshipMemory)
+        ON (n.content_vector) 
+        OPTIONS {indexConfig: {
+            `vector.dimensions`: 384,
+            `vector.similarity_function`: 'cosine'
+        }}
+        """
+        
         constraints_and_indexes = [
+            # --- VECTOR INDEX ---
+            vector_index_query,
+            
             # Memory node constraints
             "CREATE CONSTRAINT experience_memory_id_unique IF NOT EXISTS FOR (e:ExperienceMemory) REQUIRE e.id IS UNIQUE",
             "CREATE CONSTRAINT knowledge_memory_id_unique IF NOT EXISTS FOR (k:KnowledgeMemory) REQUIRE k.id IS UNIQUE", 
             "CREATE CONSTRAINT relationship_memory_id_unique IF NOT EXISTS FOR (r:RelationshipMemory) REQUIRE r.id IS UNIQUE",
-            "CREATE CONSTRAINT current_memory_id_unique IF NOT EXISTS FOR (c:CurrentMemory) REQUIRE c.id IS UNIQUE",
+            # REFACTOR: Removed 'current_memory_id_unique'
             
             # Performance indexes for memory contexts
             "CREATE INDEX experience_timestamp_index IF NOT EXISTS FOR (e:ExperienceMemory) ON (e.timestamp)",
@@ -185,8 +183,8 @@ class Neo4jClient:
             "CREATE INDEX knowledge_category_index IF NOT EXISTS FOR (k:KnowledgeMemory) ON (k.category)",
             "CREATE INDEX relationship_person_index IF NOT EXISTS FOR (r:RelationshipMemory) ON (r.person_name)",
             "CREATE INDEX relationship_type_index IF NOT EXISTS FOR (r:RelationshipMemory) ON (r.relationship_type)",
-            "CREATE INDEX current_focus_index IF NOT EXISTS FOR (c:CurrentMemory) ON (c.current_focus)",
-            "CREATE INDEX current_time_context_index IF NOT EXISTS FOR (c:CurrentMemory) ON (c.time_context)",
+            # REFACTOR: Removed 'current_focus_index'
+            # REFACTOR: Removed 'current_time_context_index'
             
             # Cross-context relevance indexes
             "CREATE INDEX experience_knowledge_relevance_index IF NOT EXISTS FOR (e:ExperienceMemory) ON (e.knowledge_relevance)",
@@ -204,7 +202,9 @@ class Neo4jClient:
         for constraint_or_index in constraints_and_indexes:
             try:
                 await self.execute_query(constraint_or_index)
-                logger.info(f"Created constraint/index: {constraint_or_index.split()[2]}")
+                # Get a simple name for logging
+                name = constraint_or_index.split()[2]
+                logger.info(f"Created constraint/index: {name}")
             except Exception as e:
                 logger.warning(f"Failed to create constraint/index: {e}")
     
@@ -279,16 +279,6 @@ def create_neo4j_client(
 ) -> Neo4jClient:
     """
     Factory function to create a Neo4j client with default configuration.
-    
-    Args:
-        uri: Neo4j connection URI
-        username: Database username
-        password: Database password
-        database: Database name
-        **kwargs: Additional configuration parameters
-        
-    Returns:
-        Configured Neo4jClient instance
     """
     config = Neo4jConfig(
         uri=uri,

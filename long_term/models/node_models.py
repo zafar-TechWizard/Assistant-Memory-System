@@ -12,6 +12,9 @@ from enum import Enum
 from uuid import uuid4, UUID
 
 from pydantic import BaseModel, Field, validator, root_validator
+import logging # Import logger for validation warnings
+
+logger = logging.getLogger(__name__)
 
 
 class MemoryContext(str, Enum):
@@ -19,7 +22,7 @@ class MemoryContext(str, Enum):
     EXPERIENCE = "EXPERIENCE"  # What happened to me + what I learned from it
     KNOWLEDGE = "KNOWLEDGE"    # What I know + how I use it
     RELATIONSHIP = "RELATIONSHIP"  # Who I know + how I feel + how we interact
-    CURRENT = "CURRENT"        # What I'm thinking about now + recent relevant experiences
+    # REFACTOR: Removed 'CURRENT' context to solve Gap #5
 
 
 class BaseMemoryNode(BaseModel):
@@ -31,6 +34,11 @@ class BaseMemoryNode(BaseModel):
     id: UUID = Field(default_factory=uuid4, description="Unique identifier for the memory")
     memory_context: MemoryContext = Field(description="Context this memory belongs to")
     content: str = Field(description="The actual memory content")
+    
+    # --- NEW: Add content_vector field ---
+    # This field is required for the vector index.
+    content_vector: Optional[List[float]] = Field(None, description="Vector embedding of the content")
+    
     description: Optional[str] = Field(None, description="Detailed description of the memory")
     importance_score: float = Field(default=0.5, ge=0.0, le=1.0, description="Importance score (0-1)")
     emotional_significance: float = Field(default=0.0, ge=-1.0, le=1.0, description="Emotional significance (-1 to 1)")
@@ -54,6 +62,8 @@ class BaseMemoryNode(BaseModel):
             datetime: lambda v: v.isoformat(),
             UUID: lambda v: str(v)
         }
+        # Allow extra fields (like content_vector) to be pruned if not defined in a child
+        extra = "ignore" 
     
     @validator('content')
     def content_must_not_be_empty(cls, v):
@@ -97,7 +107,7 @@ class ExperienceMemoryNode(BaseMemoryNode):
     # Context Relevance (how relevant this experience is to other contexts)
     knowledge_relevance: float = Field(default=0.5, ge=0.0, le=1.0, description="How relevant this is to knowledge context")
     relationship_relevance: float = Field(default=0.5, ge=0.0, le=1.0, description="How relevant this is to relationship context")
-    current_relevance: float = Field(default=0.5, ge=0.0, le=1.0, description="How relevant this is to current context")
+    # REFACTOR: Removed 'current_relevance'
     
     @validator('event_type')
     def validate_event_type(cls, v):
@@ -142,7 +152,7 @@ class KnowledgeMemoryNode(BaseMemoryNode):
     # Context Relevance
     experience_relevance: float = Field(default=0.5, ge=0.0, le=1.0, description="How relevant this is to experience context")
     relationship_relevance: float = Field(default=0.5, ge=0.0, le=1.0, description="How relevant this is to relationship context")
-    current_relevance: float = Field(default=0.5, ge=0.0, le=1.0, description="How relevant this is to current context")
+    # REFACTOR: Removed 'current_relevance'
     
     @validator('category')
     def validate_category(cls, v):
@@ -192,7 +202,7 @@ class RelationshipMemoryNode(BaseMemoryNode):
     # Context Relevance
     experience_relevance: float = Field(default=0.5, ge=0.0, le=1.0, description="How relevant this is to experience context")
     knowledge_relevance: float = Field(default=0.5, ge=0.0, le=1.0, description="How relevant this is to knowledge context")
-    current_relevance: float = Field(default=0.5, ge=0.0, le=1.0, description="How relevant this is to current context")
+    # REFACTOR: Removed 'current_relevance'
     
     @validator('relationship_type')
     def validate_relationship_type(cls, v):
@@ -205,56 +215,5 @@ class RelationshipMemoryNode(BaseMemoryNode):
         return v
 
 
-class CurrentMemoryNode(BaseMemoryNode):
-    """
-    Current Context Memory: What I'm thinking about now + recent relevant experiences
-    
-    Stores active, temporary information about current focus, attention,
-    and recent relevant experiences. This combines working memory with recent episodic memory.
-    """
-    memory_context: MemoryContext = Field(default=MemoryContext.CURRENT, description="Memory context")
-    
-    # Current Focus
-    current_focus: str = Field(description="What is currently being focused on")
-    attention_span: float = Field(default=0.5, ge=0.0, le=1.0, description="Current attention span (0-1)")
-    cognitive_load: float = Field(default=0.5, ge=0.0, le=1.0, description="Current cognitive load (0-1)")
-    
-    # Active Context
-    active_context: Dict[str, Any] = Field(default_factory=dict, description="Current active context information")
-    current_goals: List[str] = Field(default_factory=list, description="Current goals and objectives")
-    current_tasks: List[str] = Field(default_factory=list, description="Current tasks and activities")
-    
-    # Recent Relevance
-    recent_experiences: List[str] = Field(default_factory=list, description="Recent relevant experiences")
-    recent_knowledge: List[str] = Field(default_factory=list, description="Recently accessed knowledge")
-    recent_relationships: List[str] = Field(default_factory=list, description="Recently relevant relationships")
-    
-    # Temporal Context
-    time_context: str = Field(description="Current time context (morning, work hours, evening, etc.)")
-    urgency_level: float = Field(default=0.5, ge=0.0, le=1.0, description="Current urgency level (0-1)")
-    deadline_pressure: float = Field(default=0.0, ge=0.0, le=1.0, description="Current deadline pressure (0-1)")
-    
-    # Emotional State
-    current_mood: float = Field(default=0.0, ge=-1.0, le=1.0, description="Current emotional state (-1 to 1)")
-    stress_level: float = Field(default=0.0, ge=0.0, le=1.0, description="Current stress level (0-1)")
-    energy_level: float = Field(default=0.5, ge=0.0, le=1.0, description="Current energy level (0-1)")
-    
-    # Context Relevance
-    experience_relevance: float = Field(default=0.8, ge=0.0, le=1.0, description="How relevant this is to experience context")
-    knowledge_relevance: float = Field(default=0.8, ge=0.0, le=1.0, description="How relevant this is to knowledge context")
-    relationship_relevance: float = Field(default=0.8, ge=0.0, le=1.0, description="How relevant this is to relationship context")
-    
-    @validator('time_context')
-    def validate_time_context(cls, v):
-        common_contexts = [
-            'morning', 'afternoon', 'evening', 'night', 'work_hours', 'weekend',
-            'holiday', 'deadline', 'meeting', 'break', 'travel', 'other'
-        ]
-        if v.lower() not in common_contexts:
-            logger.warning(f"Uncommon time context: {v}")
-        return v
-
-
-# Import logger for validation warnings
-import logging
-logger = logging.getLogger(__name__)
+# REFACTOR: Removed the entire CurrentMemoryNode class
+# (This class is redundant per Gap #5. L1's WorkingMemory class serves this role.)
