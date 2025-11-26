@@ -1,154 +1,125 @@
-from datetime import datetime
-from typing import List, Dict, Any, Optional
-from uuid import uuid4
-from sofi_memory.long_term.models.node_models import CurrentMemoryNode, MemoryContext
+import time
+import json
+import logging
+from pathlib import Path
+from typing import List, Dict, Any, Optional, Set
+from dataclasses import dataclass, asdict
+from datetime import datetime, timedelta
+from threading import Lock
+from contextlib import contextmanager
 
-class ContextManager:
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+
+class WorkingContextManager:
     """
-    Manages the real-time "working memory" (Layer 1) for the AI assistant.
-
-    This class holds and manipulates the CurrentMemoryNode in-memory for a single
-    conversation session. It tracks the immediate focus, emotional state, and
-    short-term history, providing a real-time context buffer that informs
-    both the AI's responses and its long-term memory retrieval.
+    Manages reading and writing to the working_context.json file.
+    Provides thread-safe operations and error handling.
     """
-
-    def __init__(self, user_id: str, session_id: str):
-        """
-        Initializes the working memory for a new conversation session.
-
-        Args:
-            user_id (str): The ID of the user in the conversation.
-            session_id (str): The unique ID for this conversation session.
-        """
-        self.user_id = user_id
-        self.session_id = session_id
-        self.last_interaction_time = datetime.utcnow()
-        
-        # This is the AI's "conscious mind" for the session.
-        self.current_context_node = CurrentMemoryNode(
-            content="Initializing new conversation context.",
-            current_focus="greeting",
-            time_context=self._get_time_of_day(),
-            current_mood=0.1,  # Start with a neutral, slightly positive mood
-            stress_level=0.0
-        )
-        
-        # A short-term buffer for the most recent conversation turns.
-        self.short_term_history: List[Dict[str, str]] = []
-        print(f"L1 ContextManager initialized for session {self.session_id}")
-
-    def _get_time_of_day(self) -> str:
-        """Determines the general time of day."""
-        hour = datetime.now().hour
-        if 5 <= hour < 12:
-            return 'morning'
-        elif 12 <= hour < 17:
-            return 'afternoon'
-        elif 17 <= hour < 21:
-            return 'evening'
-        else:
-            return 'night'
-
-    def observe_message(self, role: str, content: str):
-        """
-        Observes a new message, updating the short-term history and interaction time.
-
-        Args:
-            role (str): The role of the speaker ('user' or 'assistant').
-            content (str): The text content of the message.
-        """
-        self.short_term_history.append({"role": role, "content": content})
-        # Keep the history buffer from growing too large
-        if len(self.short_term_history) > 10:
-            self.short_term_history.pop(0)
-            
-        self.last_interaction_time = datetime.utcnow()
-        self.current_context_node.content = f"Last message from {role}: {content}"
-        print(f"L1 observed message from {role}.")
-
-    def update_focus(self, new_focus: str, related_entities: Optional[List[str]] = None):
-        """
-        Updates the AI's current focus, typically after an intent/entity analysis.
-
-        Args:
-            new_focus (str): A concise description of the current topic.
-            related_entities (Optional[List[str]]): A list of key people, places, or
-                                                   concepts mentioned recently.
-        """
-        print(f"L1 focus updated to: '{new_focus}'")
-        self.current_context_node.current_focus = new_focus
-        if related_entities:
-            # This primes the retrieval engine with known entities.
-            self.current_context_node.recent_relationships = related_entities
-
-    def update_mood(self, mood_change: float, stress_change: float):
-        """
-        Adjusts the current emotional context of the conversation.
-
-        Args:
-            mood_change (float): A value to add to the current mood (-1.0 to 1.0).
-            stress_change (float): A value to add to the current stress level (0.0 to 1.0).
-        """
-        # Clamp values to their defined ranges from the model
-        new_mood = self.current_context_node.current_mood + mood_change
-        self.current_context_node.current_mood = max(-1.0, min(1.0, new_mood))
-        
-        new_stress = self.current_context_node.stress_level + stress_change
-        self.current_context_node.stress_level = max(0.0, min(1.0, new_stress))
-        print(f"L1 mood updated: Mood={self.current_context_node.current_mood:.2f}, Stress={self.current_context_node.stress_level:.2f}")
-
-    def get_current_context(self) -> CurrentMemoryNode:
-        """Returns the live CurrentMemoryNode object."""
-        return self.current_context_node
-
-    def build_prompt_context(self) -> str:
-        """
-        Creates a concise string summary of the current working memory.
-        This is designed to be injected directly into an LLM prompt.
-        """
-        history_str = "\n".join([f"{turn['role']}: {turn['content']}" for turn in self.short_term_history])
-        
-        context_summary = f"""
-[START of Real-Time Context]
-Current Focus: {self.current_context_node.current_focus}
-Current Mood: {self.current_context_node.current_mood:.2f} (from -1 sad to 1 happy)
-Current Stress: {self.current_context_node.stress_level:.2f} (from 0 calm to 1 stressed)
-Recent Conversation History (last {len(self.short_term_history)} turns):
-{history_str}
-[END of Real-Time Context]
-"""
-        return context_summary
-
-# --- Example Usage ---
-if __name__ == '__main__':
-    import time
-
-    print("\n--- Testing the Layer 1 ContextManager ---")
-    user_id = "zafar_001"
-    session_id = f"session_{uuid4()}"
-
-    # A conversation begins
-    l1_manager = ContextManager(user_id, session_id)
-
-    # User sends a message
-    l1_manager.observe_message("user", "Hey, I'm feeling a bit stressed about this Python bug.")
-    # In a real app, an NLP tool would analyze the sentiment
-    l1_manager.update_focus("Debugging Python Script", related_entities=["Python"])
-    l1_manager.update_mood(mood_change=-0.3, stress_change=0.4)
-
-    # Assistant responds
-    l1_manager.observe_message("assistant", "I understand. Debugging can be tricky. I'm here to help.")
     
-    # Let's see the context we would send to the LLM for its *next* response
-    prompt_context = l1_manager.build_prompt_context()
-    print("\n--- Context to be injected into LLM Prompt: ---")
-    print(prompt_context)
-
-    # The user mentions his girlfriend, Akanksha
-    l1_manager.observe_message("user", "Thanks. I was talking to Akanksha about it earlier.")
-    l1_manager.update_focus("Discussing bug with Akanksha", related_entities=["Python", "Akanksha"])
-
-    prompt_context_2 = l1_manager.build_prompt_context()
-    print("\n--- Updated Context for LLM Prompt: ---")
-    print(prompt_context_2)
+    def __init__(self, file_path: Path):
+        """
+        Initialize the context manager.
+        
+        Args:
+            file_path: Path to the working_context.json file
+        """
+        self.file_path = file_path
+        self._lock = Lock()
+        self._ensure_file_exists()
+    
+    def _ensure_file_exists(self):
+        """Ensure the working context file exists with proper structure."""
+        if not self.file_path.exists():
+            logger.warning(f"Working context file not found. Creating: {self.file_path}")
+            self.file_path.parent.mkdir(parents=True, exist_ok=True)
+            
+            initial_data = {
+                "active_entities": {},
+                "current_entities": [],
+                "memories": []
+            }
+            
+            with open(self.file_path, 'w', encoding='utf-8') as f:
+                json.dump(initial_data, f, indent=2)
+    
+    @contextmanager
+    def _file_lock(self):
+        """Context manager for thread-safe file operations."""
+        self._lock.acquire()
+        try:
+            yield
+        finally:
+            self._lock.release()
+    
+    def load(self) -> Dict[str, Any]:
+        """
+        Load working context from file.
+        
+        Returns:
+            Dictionary containing the working context
+            
+        Raises:
+            IOError: If file cannot be read
+            json.JSONDecodeError: If file contains invalid JSON
+        """
+        with self._file_lock():
+            try:
+                with open(self.file_path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                
+                # Ensure required keys exist
+                if "active_entities" not in data:
+                    data["active_entities"] = {}
+                if "current_entities" not in data:
+                    data["current_entities"] = []
+                if "memories" not in data:
+                    data["memories"] = []
+                
+                logger.debug(f"Loaded working context: {len(data.get('active_entities', {}))} active entities")
+                return data
+                
+            except FileNotFoundError:
+                logger.error(f"Working context file not found: {self.file_path}")
+                raise
+            except json.JSONDecodeError as e:
+                logger.error(f"Invalid JSON in working context file: {e}")
+                raise
+            except Exception as e:
+                logger.error(f"Error loading working context: {e}")
+                raise
+    
+    def save(self, data: Dict[str, Any]):
+        """
+        Save working context to file.
+        
+        Args:
+            data: Dictionary containing the working context
+            
+        Raises:
+            IOError: If file cannot be written
+        """
+        with self._file_lock():
+            try:
+                # Create backup before writing
+                if self.file_path.exists():
+                    backup_path = self.file_path.with_suffix('.json.bak')
+                    with open(self.file_path, 'r', encoding='utf-8') as f:
+                        backup_data = f.read()
+                    with open(backup_path, 'w', encoding='utf-8') as f:
+                        f.write(backup_data)
+                
+                # Write new data
+                with open(self.file_path, 'w', encoding='utf-8') as f:
+                    json.dump(data, f, indent=2, ensure_ascii=False)
+                
+                logger.debug(f"Saved working context: {len(data.get('active_entities', {}))} active entities")
+                
+            except Exception as e:
+                logger.error(f"Error saving working context: {e}")
+                raise

@@ -1259,8 +1259,3 @@ def create_memory_retrieval_engine(
     return MemoryRetrievalEngine(neo4j_client, embedding_utils)
 
 
-print("=" * 100)
-print("✅ REFACTORED, ORGANIZED, AND OPTIMIZED CODE")
-print("=" * 100)
-print()
-print(refactored_code)

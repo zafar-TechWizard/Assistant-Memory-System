@@ -31,7 +31,7 @@ class Neo4jConfig(BaseModel):
     """Configuration for Neo4j connection"""
     uri: str = Field(default="bolt://localhost:7687", description="Neo4j connection URI")
     username: str = Field(default="neo4j", description="Database username")
-    password: str = Field(default="password", description="Database password")
+    password: str = Field(default="password123", description="Database password")
     database: str = Field(default="neo4j", description="Database name")
     max_connection_lifetime: int = Field(default=3600, description="Max connection lifetime in seconds")
     max_connection_pool_size: int = Field(default=100, description="Max connection pool size")
@@ -273,7 +273,7 @@ class Neo4jClient:
 def create_neo4j_client(
     uri: str = "bolt://localhost:7687",
     username: str = "neo4j", 
-    password: str = "password",
+    password: str = "password123",
     database: str = "neo4j",
     **kwargs
 ) -> Neo4jClient:

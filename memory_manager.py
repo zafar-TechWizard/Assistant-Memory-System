@@ -1,162 +1,166 @@
 import asyncio
-from typing import Dict, Any, List, Optional
-from uuid import uuid4
+import logging
+from typing import Dict, Any, Optional
 
-# Layer 1: The "Conscious Mind"
-from sofi_memory.layer1_working_memory.context_manager import ContextManager
+# The Components 
+from memory.working_memory.working_mem import WorkingMemory
+from memory.long_term.infrastructure.neo4j_client import create_neo4j_client
+from memory.long_term.infrastructure.docker_manager import DockerManager
+from memory.long_term.memory_retrieval_engine import MemoryRetrievalEngine
+from memory.processing.conversationLogger import ConversationLogger
+from memory.processing.embedding_utils import EmbeddingUtils
+from memory.config import config
 
-# Layer 2: The "Subconscious" Graph Infrastructure and Models
-from sofi_memory.long_term.infrastructure.neo4j_client import Neo4jClient, create_neo4j_client
+logger = logging.getLogger(__name__)
 
-# Processing "Plugs": The bridge between L1 and L2
-from sofi_memory.processing.retrieval_engine import RetrievalEngine
-from sofi_memory.processing.conversation_logger import ConversationLogger
-
-class UnifiedMemoryManager:
+class MemoryManager:
     """
-    The main "plug-and-play" API for the AI assistant's memory.
-
-    This class provides a single, simple interface to the entire two-layer memory
-    system. It handles real-time context management (L1), long-term memory
-    retrieval (L2), and conversation logging for background consolidation.
+    The Main Interface for the Memory System.
     """
 
-    def __init__(self, user_id: str, session_id: Optional[str] = None):
-        """
-        Initializes the memory manager for a specific user and session.
+    def __init__(self):
+        self.config = config
+        self.is_initialized = False
 
-        Args:
-            user_id (str): The unique identifier for the user.
-            session_id (Optional[str]): The ID for the conversation session. If not
-                                        provided, a new one is generated.
-        """
-        self.user_id = user_id
-        self.session_id = session_id or f"session_{uuid4()}"
-
-        # Initialize Layer 1: The real-time "working memory"
-        self.l1_manager = ContextManager(self.user_id, self.session_id)
-
-        # Initialize Layer 2 components and the "plugs" that connect to it
-        self.l2_client: Neo4jClient = create_neo4j_client()
-        self.retrieval_engine = RetrievalEngine(self.l2_client)
-        self.logger = ConversationLogger('conversation.json')
+        self.active_entities = {}
+        self.current_entities = []
         
-        # A flag to ensure we connect to the database only once per session
-        self._is_db_connected = False
-        print(f"UnifiedMemoryManager created for user '{self.user_id}'.")
+        # Components
+        self.docker_manager = None  # Docker lifecycle manager
+        self.logger = None          # Logs inputs for consolidation
+        self.l2_client = None       # Neo4j Connection
+        self.retriever = None       # L2 Reader
+        self.working_memory = None  # L1 Processor & State Manager
 
-    async def _ensure_db_connection(self):
-        """Connects to the Neo4j database if not already connected."""
-        if not self._is_db_connected:
-            await self.l2_client.connect()
-            self._is_db_connected = True
-            print("Database connection established.")
-
-    async def observe(self, role: str, message: str):
+    async def setup(self):
         """
-        Observes a new message, logs it, and updates the real-time context.
-        This is the primary INPUT method for the memory system.
-
-        Args:
-            role (str): The role of the speaker ('user' or 'assistant').
-            message (str): The content of the message.
+        Boot sequence: Connects DBs, loads models, prepares the system.
         """
-        # 1. Log the raw conversation for future consolidation
-        self.logger.log_message(self.user_id, role, message)
+        logger.info("BOOT: Starting Memory System Setup...")
+
+        # 0. Setup Docker Manager and ensure Neo4j is running
+        logger.info("BOOT: Initializing Docker Manager...")
+        self.docker_manager = DockerManager()
         
-        # 2. Update the fast, real-time Layer 1 context
-        self.l1_manager.observe_message(role, message)
-        
-        # In a real application, you would add a quick NLP step here
-        # to update focus and mood from the message content.
-        # e.g., self.l1_manager.update_focus(...)
-
-    async def get_context_for_llm(self, query_text: str) -> str:
-        """
-        Builds the complete context string to be injected into the LLM prompt.
-        This is the primary OUTPUT method of the memory system.
-
-        Args:
-            query_text (str): The latest message from the user, used for retrieval.
-
-        Returns:
-            str: A formatted string containing both short-term (L1) and
-                 relevant long-term (L2) memories.
-        """
-        await self._ensure_db_connection()
-
-        # 1. Get the real-time context from Layer 1
-        l1_context_str = self.l1_manager.build_prompt_context()
-        
-        # 2. Use the retrieval engine to find relevant long-term memories
-        retrieved_memories = await self.retrieval_engine.retrieve_memories(query_text)
-        
-        # 3. Format the retrieved memories into a clean string
-        l2_context_str = self._format_retrieved_memories(retrieved_memories)
-        
-        return f"{l1_context_str}\n{l2_context_str}"
-
-    def _format_retrieved_memories(self, memories: List[Dict[str, Any]]) -> str:
-        """Formats the complex retrieval results into a simple string for the LLM."""
-        if not memories:
-            return "[No relevant long-term memories found]"
-
-        formatted_string = "[Relevant Long-Term Memories]\n"
-        for item in memories:
-            node = item.get('node', {})
-            score = item.get('score', 0.0)
-            related = item.get('related_nodes', [])
+        try:
+            # Start Docker container (idempotent - safe to call multiple times)
+            self.docker_manager.start_docker()
             
-            # Main memory found by vector search
-            formatted_string += f"- Primary Memory (Relevance: {score:.2f}): "
-            formatted_string += f"[{node.get('memory_context')}] {node.get('content')}\n"
+            # Ensure Neo4j is ready to accept connections
+            self.docker_manager.ensure_connection()
             
-            # Related memories found by graph traversal
-            if related:
-                for rel_node in related:
-                    formatted_string += f"  - Linked Memory: [{rel_node.get('memory_context')}] {rel_node.get('content')}\n"
-        
-        return formatted_string
+            logger.info("BOOT: Docker and Neo4j are ready")
+        except Exception as e:
+            logger.error(f"BOOT: Failed to start Docker/Neo4j: {e}")
+            raise RuntimeError(
+                f"Failed to start Neo4j Docker container. "
+                f"Please ensure Docker Desktop is running. Error: {e}"
+            )
 
-    async def disconnect(self):
-        """Gracefully disconnects from the database."""
-        if self._is_db_connected:
+        # 1. Setup Logging (For the 'Dreaming' process later)
+        self.logger = ConversationLogger(
+            user_id=self.config.user_id,
+            filepath=str(self.config.conversation_log_path)
+        )
+
+        # 2. Setup Long Term Memory (L2) Infrastructure
+        # Use SOFI configuration from docker_manager
+        self.l2_client = create_neo4j_client(
+            uri=SOFI_NEO4J_CONFIG["uri"],
+            username=SOFI_NEO4J_CONFIG["username"],
+            password=SOFI_NEO4J_CONFIG["password"],
+            database=SOFI_NEO4J_CONFIG["database"]
+        )
+        await self.l2_client.connect()
+        
+        # 3. Setup Retrieval Engine (The Bridge between L1 and L2)
+        # This engine handles the complex Graph+Vector queries
+        self.retriever = MemoryRetrievalEngine(
+            neo4j_client=self.l2_client,
+            embedding_utils=EmbeddingUtils() 
+        )
+
+        # 4. Setup Working Memory (The Processor)
+        # We inject the retriever so L1 can 'ask' L2 for data
+        self.working_memory = WorkingMemory(
+            user_id=self.config.user_id,
+            retrieval_engine=self.retriever
+        )
+
+        self.is_initialized = True
+        logger.info("BOOT: Memory System Ready.")
+
+    async def observe(self, role: str, content: str):
+        """
+        Input Method: Takes a signal, logs it, and processes it into Working Context.
+        """
+        if not self.is_initialized:
+            raise RuntimeError("Memory System not initialized. Run await setup() first.")
+
+        # Step A: Log raw data (for nightly consolidation)
+        # We do this first to ensure data safety
+        self.logger.log_message(role, content)
+
+        # Step B: Process into Working Memory (in background)
+        # This updates the 'Working Context' state (History, Focus, L2 Retrieval)
+        # Run in background task without waiting for completion
+        message = [{"role": role, "content": content}]
+
+        loop = asyncio.get_running_loop()
+
+        # Fire-and-forget background thread
+        asyncio.create_task(
+            loop.run_in_executor(
+                None,  # None = default ThreadPoolExecutor
+                self.working_memory.reactive_processing,
+                message
+            )
+        )
+
+
+    def get_context(self, role: str, message: str):
+        """
+        Output Method: Returns the current state of the 'Mind' to the Assistant.
+        """
+        if not self.is_initialized:
+            raise RuntimeError("Memory System not initialized.")
+
+        return self.working_memory.get_working_context(role, message)
+
+    async def shutdown(self, stop_docker: bool = False):
+        """
+        Graceful shutdown.
+        
+        Args:
+            stop_docker: If True, stops the Docker container. Default False to leave it running.
+        """
+        if self.l2_client:
             await self.l2_client.disconnect()
-            self._is_db_connected = False
-            print("Database connection closed.")
+        
+        if stop_docker and self.docker_manager:
+            logger.info("SHUTDOWN: Stopping Docker container...")
+            self.docker_manager.stop_docker()
+        
+        logger.info("SHUTDOWN: Memory System stopped.")
 
-# --- Example End-to-End Usage ---
-async def main():
-    print("\n--- Testing the Unified Memory Manager ---")
-    
-    # Imagine the AI assistant starts a new conversation with you
-    user = "Zafar"
-    memory = UnifiedMemoryManager(user_id=user)
 
-    # You send your first message
-    message1 = "Feeling a bit stuck on a project. I was talking to Akanksha about it."
-    await memory.observe("user", message1)
 
-    # The assistant needs to respond. It calls the memory manager to get context.
-    print(f"\n--- Building context for assistant's response to: '{message1}' ---")
-    context = await memory.get_context_for_llm(message1)
-    
-    # This full context string would be sent to the main LLM
-    print("\n--- Full Context String for LLM Prompt ---")
-    print(context)
-    print("------------------------------------------")
+# --- Quick Test Block ---
+if __name__ == "__main__":
+    async def main():
+        manager = MemoryManager()
+        try:
+            await manager.setup()
+            
+            # simulate input
+            await manager.observe("user", "I am working on the memory refactor.")
+            
+            # get context
+            ctx = manager.get_context("user", "I am working on the memory refactor.")
+            print("\n--- WORKING CONTEXT ---")
+            print(ctx.to_prompt_header())
+            
+        finally:
+            await manager.shutdown()
 
-    # Based on the context, the LLM generates a response, which is also observed.
-    assistant_response = "I remember you mentioned Akanksha is your girlfriend. Talking things through can be really helpful!"
-    await memory.observe("assistant", assistant_response)
-
-    # Let's see how the L1 context has changed
-    print("\n--- L1 context has now been updated with the assistant's response ---")
-    print(memory.l1_manager.build_prompt_context())
-
-    # Clean up the connection
-    await memory.disconnect()
-
-if __name__ == '__main__':
-    # This runs the example usage function
     asyncio.run(main())

@@ -65,18 +65,18 @@ class BaseMemoryNode(BaseModel):
         # Allow extra fields (like content_vector) to be pruned if not defined in a child
         extra = "ignore" 
     
-    @validator('content')
-    def content_must_not_be_empty(cls, v):
-        if not v or not v.strip():
-            raise ValueError('Content cannot be empty')
-        return v.strip()
+    # @validator('content')
+    # def content_must_not_be_empty(cls, v):
+    #     if not v or not v.strip():
+    #         raise ValueError('Content cannot be empty')
+    #     return v.strip()
     
-    @root_validator
-    def update_timestamp_on_change(cls, values):
-        """Update last_updated timestamp when memory is modified"""
-        if 'last_updated' in values:
-            values['last_updated'] = datetime.now()
-        return values
+    # @root_validator
+    # def update_timestamp_on_change(cls, values):
+    #     """Update last_updated timestamp when memory is modified"""
+    #     if 'last_updated' in values:
+    #         values['last_updated'] = datetime.now()
+    #     return values
 
 
 class ExperienceMemoryNode(BaseMemoryNode):

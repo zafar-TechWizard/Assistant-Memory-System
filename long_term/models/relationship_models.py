@@ -130,12 +130,12 @@ class MemoryRelationshipEdge(BaseModel):
             raise ValueError('Confidence must be between 0.0 and 1.0')
         return v
     
-    @root_validator
-    def update_reinforcement_timestamp(cls, values):
-        """Update last_reinforced timestamp when relationship is modified"""
-        if 'last_reinforced' in values:
-            values['last_reinforced'] = datetime.now()
-        return values
+    # @root_validator
+    # def update_reinforcement_timestamp(cls, values):
+    #     """Update last_reinforced timestamp when relationship is modified"""
+    #     if 'last_reinforced' in values:
+    #         values['last_reinforced'] = datetime.now()
+    #     return values
 
 
 # Memory relationship type mappings for easy access
