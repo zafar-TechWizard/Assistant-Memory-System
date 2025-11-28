@@ -11,7 +11,9 @@ from memory.processing.conversationLogger import ConversationLogger
 from memory.processing.embedding_utils import EmbeddingUtils
 from memory.config import config
 
-logger = logging.getLogger(__name__)
+from utils.logger import UniversalLogger
+
+logger = UniversalLogger.get_logger("memory")
 
 class MemoryManager:
     """
@@ -26,20 +28,19 @@ class MemoryManager:
         self.current_entities = []
         
         # Components
-        self.docker_manager = None  # Docker lifecycle manager
-        self.logger = None          # Logs inputs for consolidation
-        self.l2_client = None       # Neo4j Connection
-        self.retriever = None       # L2 Reader
-        self.working_memory = None  # L1 Processor & State Manager
+        self.docker_manager = None
+        self.logger = None
+        self.l2_client = None
+        self.retriever = None
+        self.working_memory = None
 
     async def setup(self):
         """
         Boot sequence: Connects DBs, loads models, prepares the system.
         """
-        logger.info("BOOT: Starting Memory System Setup...")
+        logger.info("Starting Memory System Setup...")
 
         # 0. Setup Docker Manager and ensure Neo4j is running
-        logger.info("BOOT: Initializing Docker Manager...")
         self.docker_manager = DockerManager()
         
         try:
@@ -48,13 +49,10 @@ class MemoryManager:
             
             # Ensure Neo4j is ready to accept connections
             self.docker_manager.ensure_connection()
-            
-            logger.info("BOOT: Docker and Neo4j are ready")
         except Exception as e:
-            logger.error(f"BOOT: Failed to start Docker/Neo4j: {e}")
             raise RuntimeError(
-                f"Failed to start Neo4j Docker container. "
-                f"Please ensure Docker Desktop is running. Error: {e}"
+                "Failed to start Neo4j Docker container. "
+                "Please ensure Docker Desktop is running. Error: {e}"
             )
 
         # 1. Setup Logging (For the 'Dreaming' process later)
@@ -64,31 +62,28 @@ class MemoryManager:
         )
 
         # 2. Setup Long Term Memory (L2) Infrastructure
-        # Use SOFI configuration from docker_manager
         self.l2_client = create_neo4j_client(
-            uri=SOFI_NEO4J_CONFIG["uri"],
-            username=SOFI_NEO4J_CONFIG["username"],
-            password=SOFI_NEO4J_CONFIG["password"],
-            database=SOFI_NEO4J_CONFIG["database"]
+            uri=self.config.neo4j_uri,
+            username=self.config.neo4j_username,
+            password=self.config.neo4j_password,
+            database=self.config.database
         )
         await self.l2_client.connect()
         
         # 3. Setup Retrieval Engine (The Bridge between L1 and L2)
-        # This engine handles the complex Graph+Vector queries
         self.retriever = MemoryRetrievalEngine(
             neo4j_client=self.l2_client,
             embedding_utils=EmbeddingUtils() 
         )
 
         # 4. Setup Working Memory (The Processor)
-        # We inject the retriever so L1 can 'ask' L2 for data
         self.working_memory = WorkingMemory(
             user_id=self.config.user_id,
             retrieval_engine=self.retriever
         )
 
         self.is_initialized = True
-        logger.info("BOOT: Memory System Ready.")
+        logger.info("Memory System Ready.")
 
     async def observe(self, role: str, content: str):
         """
@@ -97,13 +92,8 @@ class MemoryManager:
         if not self.is_initialized:
             raise RuntimeError("Memory System not initialized. Run await setup() first.")
 
-        # Step A: Log raw data (for nightly consolidation)
-        # We do this first to ensure data safety
-        self.logger.log_message(role, content)
 
-        # Step B: Process into Working Memory (in background)
-        # This updates the 'Working Context' state (History, Focus, L2 Retrieval)
-        # Run in background task without waiting for completion
+        # Process into Working Memory (in background)
         message = [{"role": role, "content": content}]
 
         loop = asyncio.get_running_loop()
@@ -117,6 +107,8 @@ class MemoryManager:
             )
         )
 
+        logger.info("Memory observed started in background.")
+
 
     def get_context(self, role: str, message: str):
         """
@@ -127,6 +119,7 @@ class MemoryManager:
 
         return self.working_memory.get_working_context(role, message)
 
+    
     async def shutdown(self, stop_docker: bool = False):
         """
         Graceful shutdown.
@@ -146,21 +139,24 @@ class MemoryManager:
 
 
 # --- Quick Test Block ---
+async def main():
+    manager = MemoryManager()
+    try:
+        await manager.setup()
+        
+        # simulate input
+        await manager.observe("user", "I am working on the memory refactor.")
+        
+        # get context
+        ctx = manager.get_context("user", "I am working on the memory refactor.")
+        print("\n--- WORKING CONTEXT ---")
+        print(ctx.to_prompt_header())
+        
+    finally:
+        await manager.shutdown()
+
+        
 if __name__ == "__main__":
-    async def main():
-        manager = MemoryManager()
-        try:
-            await manager.setup()
-            
-            # simulate input
-            await manager.observe("user", "I am working on the memory refactor.")
-            
-            # get context
-            ctx = manager.get_context("user", "I am working on the memory refactor.")
-            print("\n--- WORKING CONTEXT ---")
-            print(ctx.to_prompt_header())
-            
-        finally:
-            await manager.shutdown()
+    
 
     asyncio.run(main())
