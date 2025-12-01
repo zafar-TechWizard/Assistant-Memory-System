@@ -1,18 +1,59 @@
 import json
 import os
+from pathlib import Path
 from datetime import datetime, timedelta
 from uuid import uuid4
+from typing import Optional
+from utils.logger import UniversalLogger
+from memory.config import config
+
+
+logger = UniversalLogger.get_logger("conversation_logger")
+
 
 class ConversationLogger:
     """
     Manages logging conversations to a JSON file with session handling.
+    Configuration is loaded from memory.config.
     """
 
-    def __init__(self, user_id: str, filepath: str, session_timeout_minutes: int = 30):
+    def __init__(self, user_id: Optional[str] = None, filepath: Optional[str] = None, session_timeout_minutes: Optional[int] = None):
+        """
+        Initialize ConversationLogger.
         
-        self.user = user_id
-        self.filepath = filepath
-        self.session_timeout = timedelta(minutes=session_timeout_minutes)
+        Args:
+            user_id: User ID (defaults to config value)
+            filepath: Path to conversation log file (defaults to config value)
+            session_timeout_minutes: Session timeout in minutes (defaults to config value)
+        """
+        # Load configuration
+        wm_config = config.get("working_memory", {})
+        base_path = Path(config.get("base_path", "."))
+        
+        # Set user ID
+        self.user = user_id or config.get("user_id", "default_user")
+        
+        # Set filepath
+        if filepath:
+            self.filepath = filepath
+        else:
+            conversation_log_file = wm_config.get(
+                "conversation_log_file",
+                "memory/data/conversation.json"
+            )
+            self.filepath = str(base_path / conversation_log_file)
+        
+        # Set session timeout
+        timeout_minutes = session_timeout_minutes or wm_config.get("session_timeout_minutes", 30)
+        self.session_timeout = timedelta(minutes=timeout_minutes)
+        
+        # Ensure directory exists
+        os.makedirs(os.path.dirname(self.filepath), exist_ok=True)
+        
+        logger.info(
+            f"ConversationLogger initialized: user={self.user}, "
+            f"filepath={self.filepath}, timeout={timeout_minutes}min"
+        )
 
     def _load_data(self) -> dict:
         """
@@ -22,15 +63,20 @@ class ConversationLogger:
         if not os.path.exists(self.filepath):
             return {}
         try:
-            with open(self.filepath, 'r') as f:
+            with open(self.filepath, 'r', encoding='utf-8') as f:
                 return json.load(f)
-        except (json.JSONDecodeError, FileNotFoundError):
+        except (json.JSONDecodeError, FileNotFoundError) as e:
+            logger.warning(f"Could not load conversation data: {e}")
             return {}
 
     def _save_data(self, data: dict):
         """Saves the given data to the JSON file with pretty printing."""
-        with open(self.filepath, 'w') as f:
-            json.dump(data, f, indent=2)
+        try:
+            with open(self.filepath, 'w', encoding='utf-8') as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            logger.error(f"Error saving conversation data: {e}")
+            raise
 
     def _create_new_session(self) -> dict:
         """Creates the JSON structure for a new session."""
@@ -43,13 +89,16 @@ class ConversationLogger:
     def log_message(self, role: str, content: str):
         """
         Logs a new message for a user, handling session logic.
-
+        
+        Args:
+            role: Message role (user/assistant/system)
+            content: Message content
         """
         all_data = self._load_data()
         now = datetime.utcnow()
 
         # Get the user's conversation history, or create it if it doesn't exist
-        user_key = f"user_{self.user}"  # FIX: Use consistent format with consolidation
+        user_key = f"user_{self.user}"
         user_sessions = all_data.get(user_key, [])
 
         current_session = None
@@ -63,20 +112,19 @@ class ConversationLogger:
                 # Check if the last message is within the timeout window
                 if now - last_message_time.replace(tzinfo=None) < self.session_timeout:
                     current_session = last_session
-                    print(f"Continuing existing session: {current_session['session_id']}")
+                    logger.debug(f"Continuing existing session: {current_session['session_id']}")
 
         # If no active session, create a new one
         if not current_session:
-            current_session = self._create_new_session(self.user)
+            current_session = self._create_new_session()
             user_sessions.append(current_session)
-            print(f"Starting new session: {current_session['session_id']}")
+            logger.info(f"Starting new session: {current_session['session_id']}")
 
         # Create the new message "turn"
         new_turn = {
             "role": role,
             "content": content,
-            "timestamp": now.isoformat() + "Z",
-            "consolidated": False
+            "timestamp": now.isoformat() + "Z"
         }
 
         # Add the new turn to the current session
@@ -85,6 +133,39 @@ class ConversationLogger:
         # Update the data and save it
         all_data[user_key] = user_sessions
         self._save_data(all_data)
-        print(f"Logged message for {self.user} in role {role}.")
-
-
+        logger.debug(f"Logged message for {self.user} in role {role}")
+    
+    def get_current_session(self) -> dict:
+        """
+        Get the current active session.
+        
+        Returns:
+            Current session dictionary or None if no active session
+        """
+        all_data = self._load_data()
+        user_key = f"user_{self.user}"
+        user_sessions = all_data.get(user_key, [])
+        
+        if user_sessions:
+            return user_sessions[-1]
+        return None
+    
+    def get_conversation_history(self, max_turns: Optional[int] = None) -> list:
+        """
+        Get conversation history from current session.
+        
+        Args:
+            max_turns: Maximum number of turns to return (None for all)
+            
+        Returns:
+            List of conversation turns
+        """
+        session = self.get_current_session()
+        if not session:
+            return []
+        
+        conversations = session.get('conversations', [])
+        
+        if max_turns:
+            return conversations[-max_turns:]
+        return conversations
