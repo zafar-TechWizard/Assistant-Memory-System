@@ -17,6 +17,7 @@ from memory.processing.entity_extractor import EntityExtractor
 # TODO:
 #  - Add proper Memory retrival.
 #  - Implement get working context
+#  - make current context to be at global Level, so we dont have to make multiple request for same (in reactive and in get working context).
 
 
 # Initialize logger
