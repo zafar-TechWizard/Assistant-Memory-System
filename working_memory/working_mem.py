@@ -14,6 +14,10 @@ from memory.working_memory.context_manager import WorkingContextManager
 from memory.processing.conversationLogger import ConversationLogger
 from memory.processing.entity_extractor import EntityExtractor
 
+# TODO:
+#  - Add proper Memory retrival.
+#  - Implement get working context
+
 
 # Initialize logger
 logger = UniversalLogger.get_logger("working_memory")
