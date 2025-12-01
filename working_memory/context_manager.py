@@ -1,24 +1,20 @@
 import time
 import json
-import logging
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Set
 from dataclasses import dataclass, asdict
 from datetime import datetime, timedelta
 from threading import Lock
 from contextlib import contextmanager
+from utils.logger import UniversalLogger
 
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
+logger = UniversalLogger.get_logger("working_memory")
 
 
 class WorkingContextManager:
     """
-    Manages reading and writing to the working_context.json file.
+    Manages reading and writing to the working_context file.
     Provides thread-safe operations and error handling.
     """
     
@@ -27,7 +23,7 @@ class WorkingContextManager:
         Initialize the context manager.
         
         Args:
-            file_path: Path to the working_context.json file
+            file_path: Path to the working_context file
         """
         self.file_path = file_path
         self._lock = Lock()
