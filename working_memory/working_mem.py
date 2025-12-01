@@ -1,26 +1,22 @@
 import time
 import json
-import logging
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Set
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from threading import Lock
-from contextlib import contextmanager
-from context_manager import WorkingContextManager
-# from memory.working_memory.context_manager import WorkingContextManager
+from concurrent.futures import ThreadPoolExecutor, Future
+import threading
+from utils.logger import UniversalLogger
+
+from memory.config import config
+from memory.working_memory.context_manager import WorkingContextManager
+from memory.processing.conversationLogger import ConversationLogger
+from memory.processing.entity_extractor import EntityExtractor
 
 
-WORKING_CONTEXT_FILE = Path("data/working_context.json")
-ENTITY_EXPIRY_MINUTES = 15
-ENTITY_EXPIRY_MS = ENTITY_EXPIRY_MINUTES * 60 * 1000
-
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
-
+# Initialize logger
+logger = UniversalLogger.get_logger("working_memory")
 
 
 def current_time_seconds() -> float:
@@ -33,42 +29,8 @@ def current_time_ms() -> int:
     return int(time.time() * 1000)
 
 
-def extract_entities(text: str) -> List[str]:
-    """
-    Extract entities from text.
-    
-    This is a placeholder implementation. In production, replace with:
-    - NER (Named Entity Recognition) model
-    - spaCy entity extraction
-    - Custom entity extraction logic
-    - LLM-based entity extraction
-    
-    Args:
-        text: Input text to extract entities from
-        
-    Returns:
-        List of extracted entity names
-    """
-    words = text.split()
-    entities = []
-    
-    for word in words:
-        clean_word = ''.join(c for c in word if c.isalnum())
-        
-        if len(clean_word) > 4 and (word[0].isupper() or len(clean_word) > 6):
-            entities.append(clean_word.lower())
-    
-    seen = set()
-    unique_entities = []
-    for entity in entities:
-        if entity not in seen:
-            seen.add(entity)
-            unique_entities.append(entity)
-    
-    return unique_entities
 
-
-def fetch_long_term_memory(entity: str) -> List[Dict[str, Any]]:
+def fetch_long_term_memory(entity: str, max_results: int = 5) -> List[Dict[str, Any]]:
     """
     Fetch relevant long-term memories for an entity.
     
@@ -80,12 +42,14 @@ def fetch_long_term_memory(entity: str) -> List[Dict[str, Any]]:
     
     Args:
         entity: Entity name to fetch memories for
+        max_results: Maximum number of memories to return
         
     Returns:
         List of memory objects related to the entity
     """
     logger.info(f"Fetching long-term memories for entity: {entity}")
     
+    # Placeholder implementation
     return [
         {
             "entity": entity,
@@ -97,10 +61,6 @@ def fetch_long_term_memory(entity: str) -> List[Dict[str, Any]]:
         }
     ]
 
-
-# ===========================
-# Working Memory Class
-# ===========================
 
 class WorkingMemory:
     """
@@ -118,73 +78,102 @@ class WorkingMemory:
         Initialize Working Memory.
         
         Args:
-            context_file: Path to working_context.json (optional)
+            context_file: Optional path to working_context
         """
-        self.context_file = context_file or WORKING_CONTEXT_FILE
+        # Load configuration from config file
+        wm_config = config.get("working_memory", {})
+        base_path = Path(config.get("base_path", "."))
+        
+        # File paths
+        if context_file:
+            self.context_file = context_file
+        else:
+            self.context_file = base_path / wm_config.get(
+                "context_file", 
+                "memory/working_memory/data/working_context.json"
+            )
+        
+        # Timing configuration
+        self.entity_expiry_minutes = wm_config.get("entity_expiry_minutes", 15)
+        self.entity_expiry_ms = self.entity_expiry_minutes * 60 * 1000
+        self.context_retrieval_timeout_ms = wm_config.get("context_retrieval_timeout_ms", 500)
+        
+        # Memory configuration
+        self.max_memories_per_entity = wm_config.get("max_memories_per_entity", 5)
+        self.enable_auto_cleanup = wm_config.get("enable_auto_cleanup", True)
+        
+        # Ensure data directory exists
+        self.context_file.parent.mkdir(parents=True, exist_ok=True)
+        
+        # Initialize context manager
         self.context_manager = WorkingContextManager(self.context_file)
-        self.entity_expiry_ms = ENTITY_EXPIRY_MS
         
-        logger.info(f"Working Memory initialized with file: {self.context_file}")
-        logger.info(f"Entity expiry timeout: {ENTITY_EXPIRY_MINUTES} minutes ({self.entity_expiry_ms}ms)")
+        # Initialize conversation logger
+        self.conversation_logger = ConversationLogger()
+
+        # Initialize entity extractor
+        self.entity_extractor = EntityExtractor(strict_spacy=False)
+        
+        # Thread pool for async operations (logging, entity extraction)
+        # Using 2 workers: 1 for logging, 1 for entity extraction
+        self._executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="WorkingMemory")
+        
+        logger.info(
+            f"Working Memory initialized: context_file={self.context_file}, "
+            f"entity_expiry={self.entity_expiry_minutes}min, "
+            f"timeout={self.context_retrieval_timeout_ms}ms"
+        )
+
     
-    def reactive_processing(self, messages: List[Dict[str, str]]) -> Dict[str, Any]:
+    def reactive_processing(self, role: str, content: str) -> Dict[str, Any]:
         """
-        Main reactive processing method.
-        
-        Process flow:
-        1. Load active entities from working_context.json
-        2. Extract entities from messages
-        3. Update current_entities in JSON
-        4. For existing entities: refresh expiry time to 15 minutes
-        5. For new entities: add to active_entities with 15 minute expiry
-        6. Fetch long-term memories for new entities
-        7. Update memories in working_context.json
-        8. Save updated context back to file
-        
+        Main reactive processing method.        
         Args:
-            messages: List of message dictionaries with 'role' and 'content' keys
+            role: Role of the message sender (user, assistant.)
+            content: Content of the message
             
         Returns:
             Updated working context dictionary
-            
-        Example:
-            >>> wm = WorkingMemory()
-            >>> messages = [
-            ...     {"role": "user", "content": "I met Sarah yesterday"},
-            ...     {"role": "assistant", "content": "How is Sarah doing?"}
-            ... ]
             >>> context = wm.reactive_processing(messages)
         """
         try:
-            logger.info(f"Starting reactive processing for {len(messages)} message(s)")
+            logger.info(f"Starting reactive processing")
             start_time = time.time()
+
+            # Extract entities asynchronously
+            entity_future = self._executor.submit(
+                self.entity_extractor.extract_entities, content
+            )
+
+            # Log message asynchronously (fire-and-forget with error handling)
+            logging_future = self._executor.submit(
+                self.conversation_logger.log_message, role, content
+            )
             
-            # Step 1: Load active entities from working_context.json
+            # Load active entities from working_context.json
             working_context = self.context_manager.load()
-            active_entities = self._parse_active_entities(working_context.get("active_entities", {}))
+            active_entities = self._parse_active_entities(
+                working_context.get("active_entities", {})
+            )
             
-            logger.debug(f"Loaded {len(active_entities)} active entities")
+            # Wait max 100ms for entity extraction (should be <10ms normally)
+            current_entities = entity_future.result(timeout=0.10)
+            logger.debug(f"Entity extraction completed: {len(current_entities)} entities")
             
-            # Step 2: Extract entities from messages
-            current_entities = self._extract_entities_from_messages(messages)
-            logger.info(f"Extracted {len(current_entities)} entities from messages: {current_entities}")
-            
-            # Step 3: Update current_entities in working context
+            # Update current_entities in working context
             working_context["current_entities"] = list(current_entities)
             
-            # Step 4 & 5: Update active entities
+            # Update active entities
             new_entities = self._update_active_entities(
                 active_entities, 
                 current_entities
             )
-            
-            logger.info(f"Found {len(new_entities)} new entities: {new_entities}")
-            
-            # Step 6: Fetch long-term memories for new entities
+
+            # Fetch long-term memories for new entities
             new_memories = self._fetch_memories_for_entities(new_entities)
             logger.info(f"Retrieved {len(new_memories)} new memories")
             
-            # Step 7: Update memories in working context
+            # Update memories in working context
             existing_memories = working_context.get("memories", [])
             working_context["memories"] = self._merge_memories(
                 existing_memories, 
@@ -193,17 +182,77 @@ class WorkingMemory:
             
             working_context["active_entities"] = active_entities
             
-            # Step 8: Save updated context
+            # Save updated context
             self.context_manager.save(working_context)
-            
-            elapsed_time = (time.time() - start_time) * 1000
-            logger.info(f"Reactive processing completed in {elapsed_time:.2f}ms")
             
             return working_context
             
         except Exception as e:
             logger.error(f"Error in reactive processing: {e}", exc_info=True)
             raise
+    
+    def get_working_context(self, role: str, content: str) -> Dict[str, Any]:
+        """
+        Get the current working context with time-budgeted retrieval.
+        
+        This method attempts to build a complete working context within the
+        configured timeout (default 500ms). If the context is incomplete,
+        it will wait for reactive processing to complete.
+        
+        Args:
+            role: Message role (user/assistant)
+            content: Message content
+        
+        Returns:
+            Current working context dictionary with:
+            - active_entities: Dict of entity names to expiry times
+            - current_entities: List of recently mentioned entities
+            - memories: List of relevant long-term memories
+            - notice: Optional message if context is incomplete
+        """
+        start_time = current_time_ms()
+        
+        # Extract entities from current message
+        current_message_entities = set(self.entity_extractor.extract_entities(content))
+        
+        # Step 1: Load current working context
+        working_context = self.context_manager.load()
+        active_entities = self._parse_active_entities(
+            working_context.get("active_entities", {})
+        )
+        
+        # Check if we have enough context
+        if self._has_enough_context(active_entities, current_message_entities):
+            logger.info("Context is complete")
+            return working_context
+        
+        # Step 2: Wait for context to be complete within time budget
+        timeout_ms = self.context_retrieval_timeout_ms
+        
+        while (current_time_ms() - start_time) <= timeout_ms:
+            try:
+                working_context = self.context_manager.load()
+                active_entities = self._parse_active_entities(
+                    working_context.get("active_entities", {})
+                )
+                
+                if self._has_enough_context(active_entities, current_message_entities):
+                    logger.info("Context is complete")
+                    return working_context
+                
+                # Small sleep to avoid busy waiting
+                time.sleep(0.01)
+                
+            except Exception as e:
+                logger.error(f"Error checking context: {e}")
+                break
+        
+        # Return context even if incomplete
+        elapsed_time = current_time_ms() - start_time
+        logger.info(f"Context retrieval completed in {elapsed_time}ms")
+        
+        return working_context
+    
     
     def _parse_active_entities(self, active_entities_data: Dict[str, Any]) -> Dict[str, int]:
         """
@@ -220,10 +269,10 @@ class WorkingMemory:
         
         for entity_name, entity_data in active_entities_data.items():
             if isinstance(entity_data, dict):
-                # Legacy format with full entity info - extract expiry_time and convert to ms
+                # Legacy format with full entity info
                 expiry_time = entity_data.get("expiry_time", 0)
-                # Convert from seconds to milliseconds if needed (legacy was in seconds)
-                if expiry_time < 10000000000:  # If less than year 2286 in seconds, it's in seconds
+                # Convert from seconds to milliseconds if needed
+                if expiry_time < 10000000000:  # Year 2286 in seconds
                     expiry_time = int(expiry_time * 1000)
                 entities[entity_name] = expiry_time
             else:
@@ -232,25 +281,7 @@ class WorkingMemory:
         
         return entities
     
-    def _extract_entities_from_messages(self, messages: List[Dict[str, str]]) -> Set[str]:
-        """
-        Extract entities from all messages.
-        
-        Args:
-            messages: List of message dictionaries
-            
-        Returns:
-            Set of unique entity names
-        """
-        all_entities = set()
-        
-        for message in messages:
-            content = message.get("content", "")
-            if content:
-                entities = extract_entities(content)
-                all_entities.update(entities)
-        
-        return all_entities
+    
     
     def _update_active_entities(
         self, 
@@ -260,11 +291,11 @@ class WorkingMemory:
         """
         Update active entities with current entities.
         
-        For existing entities: refresh expiry time to 15 minutes from now
-        For new entities: add with 15 minute expiry
+        For existing entities: refresh expiry time
+        For new entities: add with expiry
         
         Args:
-            active_entities: Current active entities dictionary {entity_name: expiry_time_ms}
+            active_entities: Current active entities {entity_name: expiry_time_ms}
             current_entities: Entities extracted from messages
             
         Returns:
@@ -276,17 +307,18 @@ class WorkingMemory:
         
         for entity in current_entities:
             if entity in active_entities:
-                # Existing entity: refresh expiry time to 15 minutes from now
+                # Existing entity: refresh expiry time
                 active_entities[entity] = new_expiry_time
                 logger.debug(f"Refreshed entity '{entity}' expiry to {new_expiry_time}")
             else:
-                # New entity: add with 15 minute expiry
+                # New entity: add with expiry
                 active_entities[entity] = new_expiry_time
                 new_entities.add(entity)
                 logger.debug(f"Added new entity '{entity}' with expiry {new_expiry_time}")
         
-        # Clean up expired entities
-        self._remove_expired_entities(active_entities)
+        # Clean up expired entities if enabled
+        if self.enable_auto_cleanup:
+            self._remove_expired_entities(active_entities)
         
         return new_entities
     
@@ -308,6 +340,30 @@ class WorkingMemory:
             del active_entities[entity_name]
             logger.info(f"Removed expired entity: {entity_name}")
     
+    def _has_enough_context(
+        self, 
+        active_entities: Dict[str, int], 
+        current_entities: Set[str]
+    ) -> bool:
+        """
+        Check if we have enough context for current entities.
+        
+        Args:
+            active_entities: Currently active entities
+            current_entities: Entities from current message
+            
+        Returns:
+            True if all current entities are in active entities
+        """
+        for entity in current_entities:
+            if entity not in active_entities:
+                return False
+        return True
+    
+    # ===========================
+    # Memory Management Methods
+    # ===========================
+    
     def _fetch_memories_for_entities(self, entities: Set[str]) -> List[Dict[str, Any]]:
         """
         Fetch long-term memories for a set of entities.
@@ -322,7 +378,10 @@ class WorkingMemory:
         
         for entity in entities:
             try:
-                memories = fetch_long_term_memory(entity)
+                memories = fetch_long_term_memory(
+                    entity, 
+                    max_results=self.max_memories_per_entity
+                )
                 all_memories.extend(memories)
             except Exception as e:
                 logger.error(f"Error fetching memories for entity '{entity}': {e}")
@@ -347,7 +406,6 @@ class WorkingMemory:
         # Create a set of existing memory identifiers
         existing_ids = set()
         for memory in existing_memories:
-            # Create identifier from entity and content
             identifier = f"{memory.get('entity', '')}:{memory.get('content', '')}"
             existing_ids.add(identifier)
         
@@ -360,165 +418,21 @@ class WorkingMemory:
                 merged.append(memory)
                 existing_ids.add(identifier)
         
-        logger.debug(f"Merged memories: {len(existing_memories)} existing + {len(new_memories)} new = {len(merged)} total")
-        
-        return merged
-
-    def _enough_context(self, active_entities, current_entities):
-        for entity in current_entities:
-            if entity not in active_entities:
-                return False
-        return True
-    
-    
-    def get_working_context(self,role: str, content: str) -> Dict[str, Any]:
-        """
-        Get the current working context with time-budgeted retrieval.
-        
-        This method attempts to build a complete working context within 500ms.
-        If the context is incomplete, it will try to fetch additional memories
-        for active entities until the time budget is exhausted.
-        
-        Returns:
-            Current working context dictionary with:
-            - active_entities: Dict of entity names to expiry times
-            - current_entities: List of recently mentioned entities
-            - memories: List of relevant long-term memories
-            - notice: Optional message if context is incomplete
-            
-        Time Budget: 500ms maximum
-        """
-        formated_messages = [{"role": role, "content": content}]
-        start_time = current_time_ms()
-        
-        current_message_entities = self._extract_entities_from_messages(formated_messages)
-
-        # Step 1: Load current working context
-        working_context = self.context_manager.load()
-        active_entities = self._parse_active_entities(working_context.get("active_entities", {}))
-        
-        if self._enough_context(active_entities, current_message_entities):
-            logger.info("Context is complete")
-            return working_context
-        
-
-        # Step 2: Check if we have enough context
-        # completeness_score = self._calculate_context_completeness(working_context, active_entities)
-        
-        # if completeness_score >= 0.8:
-        #     logger.info(f"Context is complete (score: {completeness_score:.2f})")
-        #     return working_context
-        
-        # Step 3: Try to improve context within 500ms time budget
-        # logger.info(f"Context incomplete (score: {completeness_score:.2f}), attempting to fetch more memories")
-        
-        
-        # Fetch memories for missing entities within time budget
-        while (current_time_ms() - start_time) <= 500:
-            
-            try:
-                working_context = self.context_manager.load()
-                active_entities = self._parse_active_entities(working_context.get("active_entities", {}))
-                
-                if self._enough_context(active_entities, current_message_entities):
-                    logger.info("Context is complete")
-                    return working_context
-                
-               
-                
-                # Recalculate completeness
-                # completeness_score = self._calculate_context_completeness(working_context, active_entities)
-                
-                
-                
-                
-            except Exception as e:
-                logger.error(f"Error fetching memories for entity '{entity}': {e}")
-                continue
-        
-        # Step 4: Return context with notice if still incomplete
-        elapsed_time = current_time_ms() - start_time
-        
-        # if completeness_score < 0.8:
-        #     working_context["notice"] = "I need a bit more time to recall all relevant context."
-        #     logger.warning(f"Context still incomplete after {elapsed_time}ms (score: {completeness_score:.2f})")
-        # else:
-            # Remove any previous notice if context is now complete
-            # working_context.pop("notice", None)
-            # logger.info(f"Context retrieval completed in {elapsed_time}ms (score: {completeness_score:.2f})")
-        
-        logger.info(f"Need More {elapsed_time}ms")
-        
-        return working_context
-    
-    def _calculate_context_completeness(
-        self, 
-        working_context: Dict[str, Any], 
-        active_entities: Dict[str, int]
-    ) -> float:
-        """
-        Calculate how complete the working context is.
-        
-        Scoring criteria:
-        - Memory coverage: Do we have memories for active entities?
-        - Memory count: Do we have sufficient memories overall?
-        - Recency: Are memories recent and relevant?
-        
-        Args:
-            working_context: Current working context dictionary
-            active_entities: Dictionary of active entities
-            
-        Returns:
-            Completeness score between 0.0 (empty) and 1.0 (complete)
-        """
-        if not active_entities:
-            # No active entities means context is trivially complete
-            return 1.0
-        
-        memories = working_context.get("memories", [])
-        
-        if not memories:
-            # No memories at all
-            return 0.0
-        
-        # Calculate entity coverage (what % of active entities have memories)
-        entities_with_memories = set()
-        for memory in memories:
-            entity = memory.get("entity")
-            if entity and entity in active_entities:
-                entities_with_memories.add(entity)
-        
-        entity_coverage = len(entities_with_memories) / len(active_entities) if active_entities else 0.0
-        
-        # Calculate memory density (how many memories per entity)
-        avg_memories_per_entity = len(memories) / len(active_entities) if active_entities else 0.0
-        memory_density_score = min(avg_memories_per_entity / 2.0, 1.0)  # Normalize to 0-1, target ~2 memories per entity
-        
-        # Weighted score: entity coverage is more important than density
-        completeness_score = (entity_coverage * 0.7) + (memory_density_score * 0.3)
-        
         logger.debug(
-            f"Completeness calculation: "
-            f"entity_coverage={entity_coverage:.2f}, "
-            f"memory_density={memory_density_score:.2f}, "
-            f"final_score={completeness_score:.2f}"
+            f"Merged memories: {len(existing_memories)} existing + "
+            f"{len(new_memories)} new = {len(merged)} total"
         )
         
-        return completeness_score
+        return merged
     
-    def clear_expired_entities(self):
-        """
-        Manually trigger cleanup of expired entities.
-        """
-        working_context = self.context_manager.load()
-        active_entities = self._parse_active_entities(working_context.get("active_entities", {}))
-        
-        self._remove_expired_entities(active_entities)
-        
-        working_context["active_entities"] = active_entities
-        self.context_manager.save(working_context)
-        
-        logger.info("Expired entities cleanup completed")
+    def __del__(self):
+        """Cleanup thread pool when WorkingMemory is destroyed."""
+        try:
+            if hasattr(self, '_executor'):
+                self._executor.shutdown(wait=True, cancel_futures=False)
+                logger.debug("Thread pool executor shutdown successfully")
+        except Exception as e:
+            logger.error(f"Error shutting down executor: {e}")
 
 
 # ===========================
@@ -561,7 +475,7 @@ def main():
     print(json.dumps(context.get("active_entities", {}), indent=2))
     
     print("\n=== MEMORIES ===")
-    print(json.dumps(context.get("memories", [])[:3], indent=2))  # Show first 3
+    print(json.dumps(context.get("memories", [])[:3], indent=2))
     print(f"... ({len(context.get('memories', []))} total memories)")
     
     # Demonstrate get_working_context
@@ -569,7 +483,10 @@ def main():
     print("GET WORKING CONTEXT EXAMPLE")
     print("="*60)
     
-    retrieved_context = wm.get_working_context("user", "I was talking to Sarah about the Python project yesterday today dayaftertommotow")
+    retrieved_context = wm.get_working_context(
+        "user", 
+        "I was talking to Sarah about the Python project"
+    )
     
     print(f"\n=== CONTEXT RETRIEVAL ===")
     print(f"Active Entities: {len(retrieved_context.get('active_entities', {}))}")
