@@ -1,111 +1,119 @@
 """
-Configuration for SOFI Memory System
+SOFi Memory System — Typed Configuration
 
-This module provides configuration management for the memory system,
-including database connections, performance settings, and feature flags.
+Single source of truth for all memory system settings.
+Access via the module-level `config` singleton:
+
+    from memory.config import config
+    config.user_id
+    config.neo4j_uri
+
+Or via the factory function (backward-compatible with consolidation.py):
+
+    from memory.config import get_config
+    cfg = get_config()
 """
 
-import os
-from typing import Optional, Dict, Any
-from pydantic import BaseSettings, Field
+from dataclasses import dataclass, field
+from pathlib import Path
 
 
-class MemoryConfig(BaseSettings):
-    """Configuration settings for the SOFI Memory System"""
-    
-    # Database Configuration
-    neo4j_uri: str = Field(default="bolt://localhost:7687", description="Neo4j connection URI")
-    neo4j_username: str = Field(default="neo4j", description="Neo4j username")
-    neo4j_password: str = Field(default="password", description="Neo4j password")
-    neo4j_database: str = Field(default="neo4j", description="Neo4j database name")
-    
-    redis_host: str = Field(default="localhost", description="Redis host")
-    redis_port: int = Field(default=6379, description="Redis port")
-    redis_password: Optional[str] = Field(default=None, description="Redis password")
-    redis_db: int = Field(default=0, description="Redis database number")
-    
-    chromadb_host: str = Field(default="localhost", description="ChromaDB host")
-    chromadb_port: int = Field(default=8000, description="ChromaDB port")
-    
-    # Performance Settings
-    max_connection_pool_size: int = Field(default=100, description="Maximum connection pool size")
-    connection_timeout: int = Field(default=60, description="Connection timeout in seconds")
-    query_timeout: int = Field(default=30, description="Query timeout in seconds")
-    
-    # Layer 1 Performance Targets
-    layer1_response_time_target: float = Field(default=0.1, description="Layer 1 response time target in seconds")
-    cache_hit_rate_target: float = Field(default=0.8, description="Target cache hit rate")
-    max_concurrent_conversations: int = Field(default=100, description="Maximum concurrent conversations")
-    
-    # Layer 2 Performance Targets
-    layer2_single_hop_target: float = Field(default=0.05, description="Layer 2 single-hop query target in seconds")
-    layer2_multi_hop_target: float = Field(default=0.2, description="Layer 2 multi-hop query target in seconds")
-    max_entities: int = Field(default=1000000, description="Maximum entities in knowledge graph")
-    max_relationships: int = Field(default=10000000, description="Maximum relationships in knowledge graph")
-    
-    # Memory System Settings
-    entity_extraction_confidence_threshold: float = Field(default=0.7, description="Minimum confidence for entity extraction")
-    relationship_inference_confidence_threshold: float = Field(default=0.6, description="Minimum confidence for relationship inference")
-    memory_consolidation_interval: int = Field(default=3600, description="Memory consolidation interval in seconds")
-    
-    # Feature Flags
-    enable_entity_extraction: bool = Field(default=True, description="Enable entity extraction")
-    enable_relationship_inference: bool = Field(default=True, description="Enable relationship inference")
-    enable_memory_consolidation: bool = Field(default=True, description="Enable memory consolidation")
-    enable_proactive_interactions: bool = Field(default=True, description="Enable proactive interactions")
-    
-    # Logging Configuration
-    log_level: str = Field(default="INFO", description="Logging level")
-    log_file: Optional[str] = Field(default=None, description="Log file path")
-    enable_performance_logging: bool = Field(default=True, description="Enable performance logging")
-    
-    class Config:
-        env_prefix = "SOFI_MEMORY_"
-        case_sensitive = False
-        env_file = ".env"
-    
-    def get_neo4j_config(self) -> Dict[str, Any]:
-        """Get Neo4j configuration dictionary"""
-        return {
-            "uri": self.neo4j_uri,
-            "username": self.neo4j_username,
-            "password": self.neo4j_password,
-            "database": self.neo4j_database,
-            "max_connection_pool_size": self.max_connection_pool_size,
-            "connection_timeout": self.connection_timeout
-        }
-    
-    def get_redis_config(self) -> Dict[str, Any]:
-        """Get Redis configuration dictionary"""
-        return {
-            "host": self.redis_host,
-            "port": self.redis_port,
-            "password": self.redis_password,
-            "db": self.redis_db
-        }
-    
-    def get_chromadb_config(self) -> Dict[str, Any]:
-        """Get ChromaDB configuration dictionary"""
-        return {
-            "host": self.chromadb_host,
-            "port": self.chromadb_port
-        }
+@dataclass
+class MemoryConfig:
+    """
+    Strongly-typed, attribute-accessible configuration for the SOFi memory system.
+    All path properties are derived from the memory/ package root automatically.
+    """
+
+    # -------------------------------------------------------------------------
+    # User Identity
+    # -------------------------------------------------------------------------
+    user_id: str = "Zafar"
+
+    # -------------------------------------------------------------------------
+    # Neo4j Database
+    # -------------------------------------------------------------------------
+    neo4j_uri: str = "bolt://localhost:7687"
+    neo4j_username: str = "neo4j"
+    neo4j_password: str = "SofiAiAssistant"
+    database: str = "neo4j"
+    container_name: str = "sofi-neo4j-memory"
+    neo4j_http_port: int = 7474
+    neo4j_bolt_port: int = 7687
+
+    # Docker / Health Check
+    neo4j_health_check_max_attempts: int = 12
+    neo4j_health_check_interval: int = 5   # seconds between poll attempts
+    neo4j_post_start_wait: int = 10        # extra seconds after "Started" message
+
+    # -------------------------------------------------------------------------
+    # Embedding
+    # -------------------------------------------------------------------------
+    embedding_model: str = "all-MiniLM-L6-v2"
+
+    # -------------------------------------------------------------------------
+    # Working Memory
+    # -------------------------------------------------------------------------
+    entity_expiry_minutes: int = 15
+    context_retrieval_timeout_ms: int = 300   # hard cap for get_context()
+    max_memories_per_entity: int = 5
+    max_total_memories: int = 50              # cap on whiteboard memory list
+    enable_auto_cleanup: bool = True
+    max_working_memory_turns: int = 10
+    retrieval_threshold: float = 0.7
+
+    # ── Working Context ────────────────────────────────────────────────────
+    working_context_recent_turns: int = 5     # how many recent turns to include in MemoryState
+    workspace_watcher_poll_interval_s: int = 5    # how often WorkspaceWatcher checks for flags
+    workspace_watcher_gap_threshold_s: int = 30   # seconds of inactivity = "conversation gap"
+
+    # -------------------------------------------------------------------------
+    # Conversation Logging
+    # -------------------------------------------------------------------------
+    session_timeout_minutes: int = 30
+
+    # -------------------------------------------------------------------------
+    # Derived Paths  (computed from the memory/ package directory)
+    # -------------------------------------------------------------------------
+    @property
+    def _memory_root(self) -> Path:
+        """Absolute path to the memory/ package directory."""
+        return Path(__file__).parent
+
+    @property
+    def data_dir(self) -> Path:
+        """Absolute path to memory/data/ — created on first access."""
+        p = self._memory_root / "data"
+        p.mkdir(parents=True, exist_ok=True)
+        return p
+
+    @property
+    def conversation_log_path(self) -> Path:
+        return self.data_dir / "conversation.json"
+
+    @property
+    def context_file_path(self) -> Path:
+        return self.data_dir / "working_context.json"
+
+    @property
+    def neo4j_data_path(self) -> str:
+        return str(self.data_dir / "neo4j_production")
+
+    # Keep `base_path` for legacy code that reads config.get("base_path")
+    @property
+    def base_path(self) -> str:
+        return str(self._memory_root.parent)
 
 
-# Global configuration instance
+# ---------------------------------------------------------------------------
+# Singleton instance — import this everywhere
+# ---------------------------------------------------------------------------
 config = MemoryConfig()
 
 
 def get_config() -> MemoryConfig:
-    """Get the global memory system configuration"""
+    """
+    Factory function — returns the global config singleton.
+    Backward-compatible with consolidation.py which imports get_config().
+    """
     return config
-
-
-def update_config(**kwargs) -> None:
-    """Update configuration settings"""
-    global config
-    for key, value in kwargs.items():
-        if hasattr(config, key):
-            setattr(config, key, value)
-        else:
-            raise ValueError(f"Unknown configuration key: {key}")

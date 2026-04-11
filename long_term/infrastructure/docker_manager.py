@@ -10,10 +10,10 @@ logger = logging.getLogger(__name__)
 # SOFI Neo4j Configuration
 SOFI_NEO4J_CONFIG = {
     "container_name": "sofi-neo4j-memory",
-    "database": "SOFI",
-    "username": "Sofi_longTerm_memory",
+    "database": "neo4j",
+    "username": "neo4j",
     "password": "SofiAiAssistant",
-    "data_path": r"C:\Users\mdzaf\OneDrive\Desktop\assistant\memory\data\neo4j_production",
+    "data_path": r"C:\Users\mdzaf\OneDrive\Desktop\assistant\BRAIN\MEMORY",
     "uri": "bolt://localhost:7687",
     "http_port": 7474,
     "bolt_port": 7687,
@@ -134,16 +134,71 @@ class DockerManager:
             self._run_command(docker_command)
             logger.info(f"Container '{self.container_name}' created and started")
     
+    async def ensure_connection_async(self) -> None:
+        """
+        Async version of ensure_connection.
+
+        Uses asyncio.sleep instead of time.sleep so the event loop is NOT
+        blocked while waiting for Neo4j to become ready.
+        """
+        import asyncio as _asyncio
+        import urllib.request
+        from urllib.error import URLError
+
+        if not self.is_container_running():
+            raise RuntimeError(f"Container '{self.container_name}' is not running")
+
+        max_attempts = self.config["health_check_max_attempts"]
+        interval     = self.config["health_check_interval"]
+        http_port    = self.config.get("http_port", 7474)
+
+        logger.info(
+            f"[async] Waiting for Neo4j to be ready "
+            f"(max {max_attempts * interval}s)..."
+        )
+
+        for attempt in range(1, max_attempts + 1):
+            await _asyncio.sleep(interval)
+
+            if not self.is_container_running():
+                raise RuntimeError(
+                    f"Container '{self.container_name}' stopped unexpectedly"
+                )
+
+            try:
+                # Use a short timeout for the request
+                response = urllib.request.urlopen(f"http://localhost:{http_port}/", timeout=2)
+                if response.getcode() == 200:
+                    logger.info(f"[async] Neo4j ready (attempt {attempt}/{max_attempts})")
+                    logger.info(
+                        f"[async] Waiting {self.config['post_start_wait']}s "
+                        f"for full initialisation..."
+                    )
+                    await _asyncio.sleep(self.config["post_start_wait"])
+                    logger.info("[async] Neo4j fully ready.")
+                    return
+            except (URLError, Exception):
+                pass
+
+            logger.debug(f"[async] Still waiting... ({attempt}/{max_attempts})")
+
+        logger.warning(
+            "[async] Max wait time reached — Neo4j may not be fully ready."
+        )
+
     def ensure_connection(self) -> None:
         """
         Ensure Neo4j is ready to accept connections.
         
-        This method performs health checks by monitoring Docker logs for the
-        "Started" message, then waits additional time for Neo4j to be fully ready.
+        This method performs health checks by polling the Neo4j HTTP API,
+        then waits additional time for Neo4j to be fully ready.
         
         Raises:
             RuntimeError: If container is not running or Neo4j fails to start
         """
+        import urllib.request
+        from urllib.error import URLError
+
         logger.info("Ensuring Neo4j is ready to accept connections...")
         
         if not self.is_container_running():
@@ -152,6 +207,7 @@ class DockerManager:
         # Health check loop
         max_attempts = self.config["health_check_max_attempts"]
         interval = self.config["health_check_interval"]
+        http_port = self.config.get("http_port", 7474)
         
         logger.info(f"Waiting for Neo4j to be ready (max {max_attempts * interval} seconds)...")
         
@@ -162,19 +218,18 @@ class DockerManager:
             if not self.is_container_running():
                 raise RuntimeError(f"Container '{self.container_name}' stopped unexpectedly")
             
-            # Check Docker logs for "Started" message
-            result = self._run_command(
-                ["docker", "logs", "--tail", "5", self.container_name],
-                check=False
-            )
-            
-            if "Started." in result.stdout or "Remote interface available" in result.stdout:
-                logger.info(f"Neo4j is ready! (took ~{attempt * interval} seconds)")
-                # Wait additional time for Neo4j to fully accept connections
-                logger.info(f"Waiting additional {self.config['post_start_wait']} seconds for full initialization...")
-                time.sleep(self.config["post_start_wait"])
-                logger.info("Neo4j is fully ready to accept connections")
-                return
+            try:
+                # Use a short timeout for the request
+                response = urllib.request.urlopen(f"http://localhost:{http_port}/", timeout=2)
+                if response.getcode() == 200:
+                    logger.info(f"Neo4j is ready! (took ~{attempt * interval} seconds)")
+                    # Wait additional time for Neo4j to fully accept connections
+                    logger.info(f"Waiting additional {self.config['post_start_wait']} seconds for full initialization...")
+                    time.sleep(self.config['post_start_wait'])
+                    logger.info("Neo4j is fully ready to accept connections")
+                    return
+            except (URLError, Exception):
+                pass
             
             logger.debug(f"  Waiting... (attempt {attempt}/{max_attempts})")
         

@@ -4,6 +4,7 @@ from enum import Enum
 import logging
 import re
 from pathlib import Path
+from collections import OrderedDict
 
 try:
     import spacy
@@ -86,6 +87,10 @@ class EntityExtractor:
     """
     Robust entity extraction with multiple strategies.
     """
+
+    # Maximum number of (text, format) pairs to cache.
+    # Old entries are evicted LRU-style when this limit is reached.
+    _CACHE_MAX_SIZE: int = 512
     
     def __init__(
         self,
@@ -143,8 +148,9 @@ class EntityExtractor:
             self.matcher = None
             self.phrase_matcher = None
         
-        # Entity cache for performance
-        self.entity_cache = {} if enable_caching else None
+        # Entity cache — bounded LRU via OrderedDict
+        # Key: f"{text}:{return_format}"  Value: extraction result
+        self._cache: OrderedDict = OrderedDict() if enable_caching else None
         
         # Tangible/Intangible classification keywords
         self.tangible_indicators = {
@@ -188,8 +194,10 @@ class EntityExtractor:
         
         # Check cache
         cache_key = f"{text}:{return_format}"
-        if self.enable_caching and cache_key in self.entity_cache:
-            return self.entity_cache[cache_key]
+        if self._cache is not None and cache_key in self._cache:
+            # Move to end (most recently used)
+            self._cache.move_to_end(cache_key)
+            return self._cache[cache_key]
         
         # Extract entities
         if self.spacy_available:
@@ -206,9 +214,12 @@ class EntityExtractor:
         # Format output
         result = self._format_output(entities, return_format)
         
-        # Cache results
-        if self.enable_caching:
-            self.entity_cache[cache_key] = result
+        # Cache result (bounded LRU)
+        if self._cache is not None:
+            self._cache[cache_key] = result
+            self._cache.move_to_end(cache_key)
+            if len(self._cache) > self._CACHE_MAX_SIZE:
+                self._cache.popitem(last=False)  # evict least-recently-used
         
         logger.debug(
             f"Extracted {len(entities)} entities from text: '{text[:50]}...'"
@@ -266,9 +277,9 @@ class EntityExtractor:
         logger.info(f"Added custom pattern: {name} ({pattern_type})")
     
     def clear_cache(self):
-        """Clear entity cache"""
-        if self.entity_cache is not None:
-            self.entity_cache.clear()
+        """Clear entity cache."""
+        if self._cache is not None:
+            self._cache.clear()
             logger.info("Entity cache cleared")
     
 

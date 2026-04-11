@@ -1,509 +1,614 @@
-import time
-import json
-from pathlib import Path
-from typing import List, Dict, Any, Optional, Set
-from dataclasses import dataclass
-from datetime import datetime, timedelta
-from threading import Lock
-from concurrent.futures import ThreadPoolExecutor, Future
-import threading
-from utils.logger import UniversalLogger
+"""
+SOFi Working Memory (L1) — In-Memory, Thread-Safe Cognitive Workspace
 
+Architecture
+============
+  State lives entirely in RAM (_state dict, protected by threading.RLock).
+  Disk is used ONLY for crash recovery (write periodically, never read polled).
+
+  Lifecycle of a single turn:
+    1. memory_manager.observe()  →  run_in_executor(reactive_processing)
+       ├─ entity extraction      (~5-20 ms, spaCy warm)
+       ├─ update active entities  (in-memory, ~0 ms)
+       ├─ LTM retrieval for NEW entities  (async bridge → Neo4j ~50-150 ms)
+       ├─ merge memories          (in-memory)
+       ├─ log conversation        (async, fire-and-forget)
+       └─ persist state to disk   (async, fire-and-forget)
+
+    2. memory_manager.get_context()  →  working_memory.get_working_context()
+       └─ threading.Event.wait(timeout)  →  read snapshot under RLock
+
+  Total observed latency budget:
+    Entity extraction + Neo4j retrieval = ~70-170 ms  (well under 300 ms)
+
+Key Design Decisions
+====================
+- NO disk polling.  get_working_context() waits on a threading.Event, not a
+  file read loop.
+- Async bridge via asyncio.run_coroutine_threadsafe() for Neo4j calls from the
+  background thread without running a second event loop.
+- Entity expiry:  active entities older than entity_expiry_minutes are pruned
+  from the whiteboard on every get_working_context() call.
+- Only NEW entities (first time seen this session) trigger LTM retrieval. Known
+  active entities just get their expiry refreshed.
+- The memory list is capped at max_total_memories to prevent unbounded growth.
+"""
+
+import asyncio
+import json
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Set
+
+from utils.logger import UniversalLogger
 from memory.config import config
-from memory.working_memory.context_manager import WorkingContextManager
+# Renamed to avoid collision with the new centralized WorkingContextManager
+from memory.working_memory.context_manager import WorkingContextManager as DiskContextManager
+from memory.working_memory.working_context import (
+    WorkingContextManager,
+    ConversationTurn,
+)
 from memory.processing.conversationLogger import ConversationLogger
 from memory.processing.entity_extractor import EntityExtractor
+from memory.long_term.memory_router import RoutedMemories
 
-# TODO:
-#  - Add proper Memory retrival.
-#  - Implement get working context
-#  - make current context to be at global Level, so we dont have to make multiple request for same (in reactive and in get working context).
-
-
-# Initialize logger
 logger = UniversalLogger.get_logger("working_memory")
 
 
-def current_time_seconds() -> float:
-    """Get current time in seconds (Unix timestamp)."""
-    return time.time()
+# ---------------------------------------------------------------------------
+# Tiny helpers
+# ---------------------------------------------------------------------------
 
-
-def current_time_ms() -> int:
-    """Get current time in milliseconds."""
+def _ts_ms() -> int:
+    """Current Unix time in milliseconds."""
     return int(time.time() * 1000)
 
 
-
-def fetch_long_term_memory(entity: str, max_results: int = 5) -> List[Dict[str, Any]]:
-    """
-    Fetch relevant long-term memories for an entity.
-    
-    This is a placeholder implementation. In production, replace with:
-    - Vector database query (Pinecone, Weaviate, Qdrant)
-    - Graph database query (Neo4j)
-    - RAG (Retrieval Augmented Generation) system
-    - Semantic search over memory store
-    
-    Args:
-        entity: Entity name to fetch memories for
-        max_results: Maximum number of memories to return
-        
-    Returns:
-        List of memory objects related to the entity
-    """
-    logger.info(f"Fetching long-term memories for entity: {entity}")
-    
-    # Placeholder implementation
-    return [
-        {
-            "entity": entity,
-            "memory_type": "factual",
-            "content": f"Long-term memory about {entity}",
-            "relevance_score": 0.85,
-            "timestamp": current_time_seconds(),
-            "source": "placeholder"
-        }
-    ]
-
+# ===========================================================================
+# WorkingMemory
+# ===========================================================================
 
 class WorkingMemory:
     """
-    Main Working Memory class implementing reactive processing.
-    
-    This class manages:
-    - Entity extraction from messages
-    - Active entity tracking with expiry
-    - Long-term memory retrieval
-    - Persistent storage of working context
+    SOFi's active cognitive workspace.
+
+    This is the 'whiteboard' that SOFi reads when generating a response.
+    It always reflects the freshest known state:
+      - Which entities are currently active (and when they expire)
+      - Which entities were in the very last message
+      - A list of relevant long-term memories surfaced by those entities
     """
-    
-    def __init__(self, context_file: Optional[Path] = None):
-        """
-        Initialize Working Memory.
-        
-        Args:
-            context_file: Optional path to working_context
-        """
-        # Load configuration from config file
-        wm_config = config.get("working_memory", {})
-        base_path = Path(config.get("base_path", "."))
-        
-        # File paths
-        if context_file:
-            self.context_file = context_file
-        else:
-            self.context_file = base_path / wm_config.get(
-                "context_file", 
-                "memory/working_memory/data/working_context.json"
-            )
-        
-        # Timing configuration
-        self.entity_expiry_minutes = wm_config.get("entity_expiry_minutes", 15)
-        self.entity_expiry_ms = self.entity_expiry_minutes * 60 * 1000
-        self.context_retrieval_timeout_ms = wm_config.get("context_retrieval_timeout_ms", 500)
-        
-        # Memory configuration
-        self.max_memories_per_entity = wm_config.get("max_memories_per_entity", 5)
-        self.enable_auto_cleanup = wm_config.get("enable_auto_cleanup", True)
-        
-        # Ensure data directory exists
-        self.context_file.parent.mkdir(parents=True, exist_ok=True)
-        
-        # Initialize context manager
-        self.context_manager = WorkingContextManager(self.context_file)
-        
-        # Initialize conversation logger
-        self.conversation_logger = ConversationLogger()
 
-        # Initialize entity extractor
+    def __init__(
+        self,
+        user_id: str,
+        retrieval_engine=None,
+        memory_router=None,
+        context_manager: Optional[WorkingContextManager] = None,
+        event_loop: Optional[asyncio.AbstractEventLoop] = None,
+        context_file: Optional[Path] = None,
+    ):
+        """
+        Args:
+            user_id:          The user this memory belongs to.
+            retrieval_engine: MemoryRetrievalEngine instance (fallback if no router).
+            memory_router:    MemoryRouter instance (preferred — enables tiered recall).
+            context_manager:  WorkingContextManager — the central state document.
+            event_loop:       The running asyncio event loop for the async bridge.
+            context_file:     Optional override for the crash-recovery file path.
+        """
+        self.user_id          = user_id
+        self.retrieval_engine = retrieval_engine
+        self._router          = memory_router
+        self._ctx_mgr         = context_manager   # central Working Context
+        self._loop            = event_loop
+
+        # ── Configuration ────────────────────────────────────────────────────
+        self._entity_expiry_ms: int = config.entity_expiry_minutes * 60 * 1000
+        self._timeout_s: float = config.context_retrieval_timeout_ms / 1000
+        self._max_per_entity: int = config.max_memories_per_entity
+        self._max_total: int = config.max_total_memories
+        self._auto_cleanup: bool = config.enable_auto_cleanup
+
+        # ── In-Memory State (the whiteboard) ─────────────────────────────────
+        self._state_lock = threading.RLock()
+        self._state: Dict[str, Any] = {
+            "active_entities":  {},   # entity → expiry_ms
+            "current_entities": [],   # entities in the most recent message
+            # ── Tiered memories (filled by MemoryRouter) ──
+            "memories": [],           # flat list — must_know first (backward compat)
+            "tiered_memories": {
+                "must_know":    [],   # directly answers the current query
+                "context":      [],   # relevant background
+                "associations": [],   # graph neighbours, loosely related
+            },
+            # ── Retrieval metadata ────────────────────────────────────────────
+            "retrieval_meta": {
+                "intent":       None,
+                "confidence":   0.0,
+                "signals_fired": [],
+                "latency_ms":   0.0,
+            },
+            "emotional_baseline": {},
+        }
+
+        # ── Background-Processing Signal ─────────────────────────────────────
+        # Set when idle/done, clear when reactive_processing is running.
+        self._processing_done = threading.Event()
+        self._processing_done.set()  # nothing in-flight at startup
+
+        # ── Persistence (crash recovery only — NO polling) ────────────────────
+        cfg_file = context_file or config.context_file_path
+        cfg_file.parent.mkdir(parents=True, exist_ok=True)
+        self._disk_ctx = DiskContextManager(cfg_file)  # disk persistence only
+        self._restore_from_disk()
+
+        # ── Supporting Components ─────────────────────────────────────────────
         self.entity_extractor = EntityExtractor(strict_spacy=False)
-        
-        # Thread pool for async operations (logging, entity extraction)
-        # Using 2 workers: 1 for logging, 1 for entity extraction
-        self._executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="WorkingMemory")
-        
+        self.conversation_logger = ConversationLogger(user_id=self.user_id)
+
+        # ── Thread Pool ───────────────────────────────────────────────────────
+        # 3 workers: LTM retrieval + logging + disk persistence run concurrently
+        self._executor = ThreadPoolExecutor(
+            max_workers=3,
+            thread_name_prefix="SOFiWM",
+        )
+
         logger.info(
-            f"Working Memory initialized: context_file={self.context_file}, "
-            f"entity_expiry={self.entity_expiry_minutes}min, "
-            f"timeout={self.context_retrieval_timeout_ms}ms"
+            f"WorkingMemory ready | user={user_id} | "
+            f"entity_expiry={config.entity_expiry_minutes}min | "
+            f"context_timeout={config.context_retrieval_timeout_ms}ms"
         )
 
-    
-    def reactive_processing(self, role: str, content: str) -> Dict[str, Any]:
+    # =========================================================================
+    # PUBLIC API
+    # =========================================================================
+
+    def reactive_processing(self, role: str, content: str) -> None:
         """
-        Main reactive processing method.        
+        Process one incoming message.
+
+        Designed to run inside a ThreadPoolExecutor (called via run_in_executor
+        from memory_manager.observe).  Never call from the async event loop
+        directly — it will block it.
+
+        Steps:
+          1. Extract entities   (~5-20 ms)
+          2. Update active entities, identify NEW ones   (~0 ms)
+          3. Fetch LTM memories for NEW entities via async bridge (~50-150 ms)
+          4. Merge memories, prune stale ones   (~0 ms)
+          5. Fire-and-forget: log conversation, persist state
+
         Args:
-            role: Role of the message sender (user, assistant.)
-            content: Content of the message
-            
-        Returns:
-            Updated working context dictionary
-            >>> context = wm.reactive_processing(messages)
+            role:    "user" | "assistant" | "system"
+            content: Raw message text.
         """
+        self._processing_done.clear()
+        t0 = time.perf_counter()
+
         try:
-            logger.info(f"Starting reactive processing")
-            start_time = time.time()
+            logger.info(f"[reactive] {role} message ({len(content)} chars)")
 
-            # Extract entities asynchronously
-            entity_future = self._executor.submit(
-                self.entity_extractor.extract_entities, content
+            # ── 1. Entity extraction ──────────────────────────────────────────
+            entities: Set[str] = set(
+                self.entity_extractor.extract_entities(content)
             )
+            logger.debug(f"[reactive] entities: {entities}")
 
-            # Log message asynchronously (fire-and-forget with error handling)
-            logging_future = self._executor.submit(
-                self.conversation_logger.log_message, role, content
-            )
-            
-            # Load active entities from working_context.json
-            working_context = self.context_manager.load()
-            active_entities = self._parse_active_entities(
-                working_context.get("active_entities", {})
-            )
-            
-            # Wait max 100ms for entity extraction (should be <10ms normally)
-            current_entities = entity_future.result(timeout=0.10)
-            logger.debug(f"Entity extraction completed: {len(current_entities)} entities")
-            
-            # Update current_entities in working context
-            working_context["current_entities"] = list(current_entities)
-            
-            # Update active entities
-            new_entities = self._update_active_entities(
-                active_entities, 
-                current_entities
+            # ── 2. Update active entities ─────────────────────────────────────
+            with self._state_lock:
+                self._state["current_entities"] = list(entities)
+                new_entities = self._update_active_entities(entities)
+
+            logger.debug(
+                f"[reactive] {len(new_entities)} new entities "
+                f"(will trigger LTM retrieval)"
             )
 
-            # Fetch long-term memories for new entities
-            new_memories = self._fetch_memories_for_entities(new_entities)
-            logger.info(f"Retrieved {len(new_memories)} new memories")
-            
-            # Update memories in working context
-            existing_memories = working_context.get("memories", [])
-            working_context["memories"] = self._merge_memories(
-                existing_memories, 
-                new_memories
+            # ── 3. LTM retrieval — router or fallback ─────────────────────────
+            if new_entities and self._loop:
+                routed = self._fetch_via_router(content, new_entities)
+                if routed is not None:
+                    with self._state_lock:
+                        self._state["tiered_memories"]["must_know"]    = routed.must_know
+                        self._state["tiered_memories"]["context"]      = routed.context
+                        self._state["tiered_memories"]["associations"] = routed.associations
+                        flat_new = routed.must_know + routed.context + routed.associations
+                        self._state["memories"] = self._merge_memories(
+                            self._state["memories"], flat_new
+                        )
+                        self._state["retrieval_meta"] = {
+                            "intent":        routed.intent.value,
+                            "confidence":    routed.confidence,
+                            "signals_fired": routed.signals_fired,
+                            "latency_ms":    routed.latency_ms,
+                        }
+                        self._state["emotional_baseline"] = routed.emotional_baseline
+
+                    # ── Push into WorkingContextManager (central state doc) ────
+                    if self._ctx_mgr:
+                        # Build recent_turns from ConversationLogger
+                        raw_turns = self.conversation_logger.get_conversation_history(
+                            max_turns=config.working_context_recent_turns * 2
+                        )
+                        recent_turns = [
+                            ConversationTurn(
+                                role=t["role"],
+                                content=t["content"],
+                                timestamp=datetime.fromisoformat(
+                                    t["timestamp"].replace("Z", "")
+                                ),
+                            )
+                            for t in raw_turns[-config.working_context_recent_turns:]
+                        ]
+                        self._ctx_mgr.update_memory(
+                            must_know=routed.must_know,
+                            context=routed.context,
+                            associations=routed.associations,
+                            recent_turns=recent_turns,
+                            retrieval_meta={
+                                "intent":        routed.intent.value,
+                                "confidence":    routed.confidence,
+                                "signals_fired": routed.signals_fired,
+                                "latency_ms":    routed.latency_ms,
+                            },
+                            emotional_baseline=routed.emotional_baseline,
+                        )
+                        # Update user state: which entities are currently in focus
+                        self._ctx_mgr.update_user_state(
+                            mentioned_entities=list(new_entities),
+                            current_focus=", ".join(list(new_entities)[:3]),
+                        )
+
+                    logger.info(
+                        f"[reactive] Router: {routed.intent.value} "
+                        f"must_know={len(routed.must_know)} "
+                        f"context={len(routed.context)} "
+                        f"assoc={len(routed.associations)} "
+                        f"in {routed.latency_ms:.1f}ms"
+                    )
+                else:
+                    # Fallback: simple topic retrieval (router unavailable)
+                    fetched = self._fetch_from_longterm(new_entities)
+                    logger.info(f"[reactive] Fallback: {len(fetched)} memories retrieved")
+                    with self._state_lock:
+                        self._state["memories"] = self._merge_memories(
+                            self._state["memories"], fetched
+                        )
+
+            # ── 4. Non-critical, fire-and-forget ─────────────────────────────
+            self._executor.submit(self._safe_log, role, content)
+            self._executor.submit(self._persist_state)
+
+            elapsed = (time.perf_counter() - t0) * 1000
+            logger.info(f"[reactive] Done in {elapsed:.1f} ms")
+
+        except Exception as exc:
+            logger.error(f"[reactive] Unexpected error: {exc}", exc_info=True)
+
+        finally:
+            # Always signal completion so get_working_context() unblocks
+            self._processing_done.set()
+
+    def get_working_context(self, role: str = "", message: str = "") -> Dict[str, Any]:
+        """
+        Return a snapshot of the current working context (the whiteboard).
+
+        Waits up to `context_retrieval_timeout_ms` for any in-flight
+        reactive_processing to finish, then returns immediately.
+
+        Returns:
+            {
+                "active_entities":  {entity_name: expiry_ms, ...},
+                "current_entities": [str, ...],
+                "memories":         [flat list — must_know first],
+                "tiered_memories":  {"must_know": [...], "context": [...], "associations": [...]},
+                "retrieval_meta":   {intent, confidence, signals_fired, latency_ms},
+                "emotional_baseline": {...}
+            }
+        """
+        completed = self._processing_done.wait(timeout=self._timeout_s)
+        if not completed:
+            logger.warning(
+                f"[context] Background processing timed out after "
+                f"{self._timeout_s * 1000:.0f} ms — returning partial context"
             )
-            
-            working_context["active_entities"] = active_entities
-            
-            # Save updated context
-            self.context_manager.save(working_context)
-            
-            return working_context
-            
+
+        with self._state_lock:
+            if self._auto_cleanup:
+                self._prune_expired_entities()
+
+            return {
+                "active_entities":    dict(self._state["active_entities"]),
+                "current_entities":   list(self._state["current_entities"]),
+                "memories":           list(self._state["memories"]),
+                "tiered_memories":    {
+                    "must_know":    list(self._state["tiered_memories"]["must_know"]),
+                    "context":      list(self._state["tiered_memories"]["context"]),
+                    "associations": list(self._state["tiered_memories"]["associations"]),
+                },
+                "retrieval_meta":     dict(self._state["retrieval_meta"]),
+                "emotional_baseline": dict(self._state["emotional_baseline"]),
+            }
+
+    def shutdown(self) -> None:
+        """
+        Flush state to disk and shut down the thread pool.
+        Call from memory_manager.shutdown() (sync context is fine).
+        """
+        logger.info("[shutdown] Flushing working memory to disk…")
+        try:
+            self._persist_state()
         except Exception as e:
-            logger.error(f"Error in reactive processing: {e}", exc_info=True)
-            raise
-    
-    def get_working_context(self, role: str, content: str) -> Dict[str, Any]:
+            logger.warning(f"[shutdown] Persist failed: {e}")
+
+        self._executor.shutdown(wait=True, cancel_futures=False)
+        logger.info("[shutdown] WorkingMemory stopped.")
+
+    # =========================================================================
+    # ENTITY MANAGEMENT
+    # =========================================================================
+
+    def _update_active_entities(self, entities: Set[str]) -> Set[str]:
         """
-        Get the current working context with time-budgeted retrieval.
-        
-        This method attempts to build a complete working context within the
-        configured timeout (default 500ms). If the context is incomplete,
-        it will wait for reactive processing to complete.
-        
-        Args:
-            role: Message role (user/assistant)
-            content: Message content
-        
-        Returns:
-            Current working context dictionary with:
-            - active_entities: Dict of entity names to expiry times
-            - current_entities: List of recently mentioned entities
-            - memories: List of relevant long-term memories
-            - notice: Optional message if context is incomplete
+        Refresh expiry for known entities; add new ones.
+
+        Returns the set of BRAND-NEW entities (those not already active).
+        Only new entities trigger LTM retrieval — refreshed ones are assumed
+        to already have their memories in the whiteboard.
+
+        Called with _state_lock held.
         """
-        start_time = current_time_ms()
-        
-        # Extract entities from current message
-        current_message_entities = set(self.entity_extractor.extract_entities(content))
-        
-        # Step 1: Load current working context
-        working_context = self.context_manager.load()
-        active_entities = self._parse_active_entities(
-            working_context.get("active_entities", {})
-        )
-        
-        # Check if we have enough context
-        if self._has_enough_context(active_entities, current_message_entities):
-            logger.info("Context is complete")
-            return working_context
-        
-        # Step 2: Wait for context to be complete within time budget
-        timeout_ms = self.context_retrieval_timeout_ms
-        
-        while (current_time_ms() - start_time) <= timeout_ms:
-            try:
-                working_context = self.context_manager.load()
-                active_entities = self._parse_active_entities(
-                    working_context.get("active_entities", {})
-                )
-                
-                if self._has_enough_context(active_entities, current_message_entities):
-                    logger.info("Context is complete")
-                    return working_context
-                
-                # Small sleep to avoid busy waiting
-                time.sleep(0.01)
-                
-            except Exception as e:
-                logger.error(f"Error checking context: {e}")
-                break
-        
-        # Return context even if incomplete
-        elapsed_time = current_time_ms() - start_time
-        logger.info(f"Context retrieval completed in {elapsed_time}ms")
-        
-        return working_context
-    
-    
-    def _parse_active_entities(self, active_entities_data: Dict[str, Any]) -> Dict[str, int]:
-        """
-        Parse active entities from JSON data.
-        
-        Args:
-            active_entities_data: Dictionary of entity data from JSON
-                                 Format: {"entity_name": expiry_time_ms}
-            
-        Returns:
-            Dictionary mapping entity names to expiry times (in milliseconds)
-        """
-        entities = {}
-        
-        for entity_name, entity_data in active_entities_data.items():
-            if isinstance(entity_data, dict):
-                # Legacy format with full entity info
-                expiry_time = entity_data.get("expiry_time", 0)
-                # Convert from seconds to milliseconds if needed
-                if expiry_time < 10000000000:  # Year 2286 in seconds
-                    expiry_time = int(expiry_time * 1000)
-                entities[entity_name] = expiry_time
+        now_ms = _ts_ms()
+        new_expiry = now_ms + self._entity_expiry_ms
+        new_entities: Set[str] = set()
+
+        for entity in entities:
+            if entity in self._state["active_entities"]:
+                self._state["active_entities"][entity] = new_expiry
+                logger.debug(f"[entities] Refreshed '{entity}'")
             else:
-                # New simple format (just expiry time in ms)
-                entities[entity_name] = entity_data
-        
-        return entities
-    
-    
-    
-    def _update_active_entities(
-        self, 
-        active_entities: Dict[str, int], 
-        current_entities: Set[str]
-    ) -> Set[str]:
-        """
-        Update active entities with current entities.
-        
-        For existing entities: refresh expiry time
-        For new entities: add with expiry
-        
-        Args:
-            active_entities: Current active entities {entity_name: expiry_time_ms}
-            current_entities: Entities extracted from messages
-            
-        Returns:
-            Set of new entity names
-        """
-        current_time_ms_val = current_time_ms()
-        new_expiry_time = current_time_ms_val + self.entity_expiry_ms
-        new_entities = set()
-        
-        for entity in current_entities:
-            if entity in active_entities:
-                # Existing entity: refresh expiry time
-                active_entities[entity] = new_expiry_time
-                logger.debug(f"Refreshed entity '{entity}' expiry to {new_expiry_time}")
-            else:
-                # New entity: add with expiry
-                active_entities[entity] = new_expiry_time
+                self._state["active_entities"][entity] = new_expiry
                 new_entities.add(entity)
-                logger.debug(f"Added new entity '{entity}' with expiry {new_expiry_time}")
-        
-        # Clean up expired entities if enabled
-        if self.enable_auto_cleanup:
-            self._remove_expired_entities(active_entities)
-        
+                logger.debug(f"[entities] New → '{entity}'")
+
         return new_entities
-    
-    def _remove_expired_entities(self, active_entities: Dict[str, int]):
+
+    def _prune_expired_entities(self) -> None:
         """
-        Remove expired entities from active entities.
-        
-        Args:
-            active_entities: Dictionary of active entities {entity_name: expiry_time_ms}
+        Remove entities past their expiry time and drop their orphaned memories.
+        Called with _state_lock held.
         """
-        current_time_ms_val = current_time_ms()
-        expired_entities = []
-        
-        for entity_name, expiry_time in active_entities.items():
-            if current_time_ms_val > expiry_time:
-                expired_entities.append(entity_name)
-        
-        for entity_name in expired_entities:
-            del active_entities[entity_name]
-            logger.info(f"Removed expired entity: {entity_name}")
-    
-    def _has_enough_context(
-        self, 
-        active_entities: Dict[str, int], 
-        current_entities: Set[str]
-    ) -> bool:
+        now_ms = _ts_ms()
+        expired = [
+            e for e, exp in self._state["active_entities"].items()
+            if now_ms > exp
+        ]
+        if not expired:
+            return
+
+        for entity in expired:
+            del self._state["active_entities"][entity]
+            logger.info(f"[entities] Expired: '{entity}'")
+
+        # Drop memories whose trigger entity is no longer active
+        active_set = set(self._state["active_entities"].keys())
+        before = len(self._state["memories"])
+        self._state["memories"] = [
+            m for m in self._state["memories"]
+            # Keep if no trigger entity tagged, or if trigger is still active
+            if not m.get("_trigger_entity")
+            or m["_trigger_entity"] in active_set
+        ]
+        pruned = before - len(self._state["memories"])
+        if pruned:
+            logger.debug(f"[entities] Pruned {pruned} stale memories")
+
+    # =========================================================================
+    # LONG-TERM MEMORY RETRIEVAL — Router Bridge + Legacy Fallback
+    # =========================================================================
+
+    def _fetch_via_router(
+        self,
+        message: str,
+        entities: Set[str],
+    ) -> Optional[RoutedMemories]:
         """
-        Check if we have enough context for current entities.
-        
-        Args:
-            active_entities: Currently active entities
-            current_entities: Entities from current message
-            
+        Bridge the async MemoryRouter into this synchronous background thread.
+
+        Uses asyncio.run_coroutine_threadsafe() to schedule router.route() on
+        the main event loop without blocking it.  Waits up to 80% of the
+        configured timeout budget so Phase A + coverage backup both fit.
+
         Returns:
-            True if all current entities are in active entities
+            RoutedMemories on success, None if router unavailable or timed out.
         """
-        for entity in current_entities:
-            if entity not in active_entities:
-                return False
-        return True
-    
-    # ===========================
-    # Memory Management Methods
-    # ===========================
-    
-    def _fetch_memories_for_entities(self, entities: Set[str]) -> List[Dict[str, Any]]:
+        if not self._router or not self._loop:
+            return None
+
+        try:
+            future = asyncio.run_coroutine_threadsafe(
+                self._router.route(message, list(entities)),
+                self._loop,
+            )
+            return future.result(timeout=self._timeout_s * 0.80)
+        except TimeoutError:
+            logger.warning(
+                f"[wm] Router timed out after {self._timeout_s * 0.80:.2f}s"
+            )
+            return None
+        except Exception as exc:
+            logger.warning(f"[wm] Router failed — falling back to direct retrieval: {exc}")
+            return None
+
+    def _fetch_from_longterm(self, entities: Set[str]) -> List[Dict[str, Any]]:
         """
-        Fetch long-term memories for a set of entities.
-        
+        Retrieve memories from Neo4j for the given entities.
+
+        Bridges the async retrieval engine into this synchronous thread via
+        asyncio.run_coroutine_threadsafe(), scheduling work on the main event
+        loop without blocking it.
+
+        ┌─────────────────────────────────────────────────────────────────┐
+        │  NOTE — Routing Intelligence (deferred)                          │
+        │                                                                   │
+        │  Currently uses get_memories_by_topic() as the default strategy. │
+        │  The routing layer (deciding WHICH retrieval method to call and  │
+        │  WHEN to call it based on intent) will be implemented in a later │
+        │  phase. All retrieval methods exist in MemoryRetrievalEngine and │
+        │  are ready to be called.                                          │
+        └─────────────────────────────────────────────────────────────────┘
+
         Args:
-            entities: Set of entity names
-            
+            entities: Set of entity names to look up.
+
         Returns:
-            List of memory objects
+            Flat list of memory dicts from Neo4j (possibly empty on error).
         """
-        all_memories = []
-        
+        if not self._loop or not self.retrieval_engine:
+            return []
+
+        all_memories: List[Dict[str, Any]] = []
+
+        # Spread the time budget across entities
+        per_entity_timeout = max(
+            0.10,
+            min(0.20, self._timeout_s * 0.6 / max(len(entities), 1)),
+        )
+
         for entity in entities:
             try:
-                memories = fetch_long_term_memory(
-                    entity, 
-                    max_results=self.max_memories_per_entity
+                # Schedule the coroutine on the main event loop
+                future = asyncio.run_coroutine_threadsafe(
+                    self.retrieval_engine.get_memories_by_topic(
+                        topic=entity,
+                        limit=self._max_per_entity,
+                    ),
+                    self._loop,
                 )
+                memories: List[Dict] = future.result(timeout=per_entity_timeout)
+
+                # Tag each memory so we can prune it when the entity expires
+                for m in memories:
+                    m["_trigger_entity"] = entity
+
                 all_memories.extend(memories)
-            except Exception as e:
-                logger.error(f"Error fetching memories for entity '{entity}': {e}")
-        
+                logger.debug(f"[ltm] '{entity}' → {len(memories)} memories")
+
+            except TimeoutError:
+                logger.warning(
+                    f"[ltm] Timed out retrieving '{entity}' "
+                    f"({per_entity_timeout * 1000:.0f} ms limit)"
+                )
+            except Exception as exc:
+                logger.warning(f"[ltm] Failed for '{entity}': {exc}")
+
         return all_memories
-    
+
+    # =========================================================================
+    # MEMORY MANAGEMENT
+    # =========================================================================
+
     def _merge_memories(
-        self, 
-        existing_memories: List[Dict[str, Any]], 
-        new_memories: List[Dict[str, Any]]
+        self,
+        existing: List[Dict[str, Any]],
+        new_memories: List[Dict[str, Any]],
     ) -> List[Dict[str, Any]]:
         """
-        Merge new memories with existing memories, avoiding duplicates.
-        
-        Args:
-            existing_memories: Current memories in working context
-            new_memories: Newly fetched memories
-            
-        Returns:
-            Merged list of memories
+        Merge new memories into existing, deduplicating by memory ID/content.
+        Caps the total list at max_total_memories (keeps most-recently added).
         """
-        # Create a set of existing memory identifiers
-        existing_ids = set()
-        for memory in existing_memories:
-            identifier = f"{memory.get('entity', '')}:{memory.get('content', '')}"
-            existing_ids.add(identifier)
-        
-        # Add only new memories that don't exist
-        merged = existing_memories.copy()
-        
-        for memory in new_memories:
-            identifier = f"{memory.get('entity', '')}:{memory.get('content', '')}"
-            if identifier not in existing_ids:
-                merged.append(memory)
-                existing_ids.add(identifier)
-        
-        logger.debug(
-            f"Merged memories: {len(existing_memories)} existing + "
-            f"{len(new_memories)} new = {len(merged)} total"
-        )
-        
+        seen: Set[str] = set()
+        merged: List[Dict[str, Any]] = []
+
+        for m in existing:
+            key = str(m.get("id") or m.get("content", ""))
+            if key not in seen:
+                seen.add(key)
+                merged.append(m)
+
+        for m in new_memories:
+            key = str(m.get("id") or m.get("content", ""))
+            if key not in seen:
+                seen.add(key)
+                merged.append(m)
+
+        # Hard cap
+        if len(merged) > self._max_total:
+            merged = merged[-self._max_total:]
+            logger.debug(f"[memories] Capped at {self._max_total}")
+
         return merged
-    
-    def __del__(self):
-        """Cleanup thread pool when WorkingMemory is destroyed."""
+
+    # =========================================================================
+    # PERSISTENCE  (crash recovery only)
+    # =========================================================================
+
+    def _restore_from_disk(self) -> None:
+        """Load previously persisted state on startup (one-time, at init)."""
         try:
-            if hasattr(self, '_executor'):
-                self._executor.shutdown(wait=True, cancel_futures=False)
-                logger.debug("Thread pool executor shutdown successfully")
-        except Exception as e:
-            logger.error(f"Error shutting down executor: {e}")
+            persisted = self._disk_ctx.load()
+            now_ms = _ts_ms()
 
+            # Parse active entities, discarding already-expired ones
+            active: Dict[str, int] = {}
+            for entity, expiry in persisted.get("active_entities", {}).items():
+                # Handle both old dict format and new int format
+                if isinstance(expiry, dict):
+                    expiry = expiry.get("expiry_time", 0)
+                    if expiry < 10_000_000_000:   # stored as seconds, not ms
+                        expiry = int(expiry * 1000)
+                if isinstance(expiry, (int, float)) and int(expiry) > now_ms:
+                    active[entity] = int(expiry)
 
-# ===========================
-# Example Usage
-# ===========================
+            with self._state_lock:
+                self._state["active_entities"] = active
+                self._state["current_entities"] = persisted.get(
+                    "current_entities", []
+                )
+                self._state["memories"] = persisted.get("memories", [])
 
-def main():
-    """Example usage of the Working Memory system."""
-    
-    # Initialize working memory
-    wm = WorkingMemory()
-    
-    # Example messages
-    messages = [
-        {
-            "role": "user",
-            "content": "I was talking to Sarah about the Python project yesterday"
-        },
-        {
-            "role": "assistant",
-            "content": "That sounds interesting! How is the project going?"
-        },
-        {
-            "role": "user",
-            "content": "Sarah mentioned that Michael is also working on it"
-        }
-    ]
-    
-    # Process messages
-    print("\n" + "="*60)
-    print("REACTIVE PROCESSING EXAMPLE")
-    print("="*60)
-    
-    context = wm.reactive_processing(messages)
-    
-    print("\n=== CURRENT ENTITIES ===")
-    print(json.dumps(context.get("current_entities", []), indent=2))
-    
-    print("\n=== ACTIVE ENTITIES ===")
-    print(json.dumps(context.get("active_entities", {}), indent=2))
-    
-    print("\n=== MEMORIES ===")
-    print(json.dumps(context.get("memories", [])[:3], indent=2))
-    print(f"... ({len(context.get('memories', []))} total memories)")
-    
-    # Demonstrate get_working_context
-    print("\n" + "="*60)
-    print("GET WORKING CONTEXT EXAMPLE")
-    print("="*60)
-    
-    retrieved_context = wm.get_working_context(
-        "user", 
-        "I was talking to Sarah about the Python project"
-    )
-    
-    print(f"\n=== CONTEXT RETRIEVAL ===")
-    print(f"Active Entities: {len(retrieved_context.get('active_entities', {}))}")
-    print(f"Total Memories: {len(retrieved_context.get('memories', []))}")
-    
-    if "notice" in retrieved_context:
-        print(f"Notice: {retrieved_context['notice']}")
-    else:
-        print("Status: Context is complete")
-    
-    print("\n" + "="*60)
+            logger.info(
+                f"[recovery] Restored {len(active)} active entities and "
+                f"{len(self._state['memories'])} memories from disk"
+            )
+        except FileNotFoundError:
+            logger.info("[recovery] No persisted state found — starting fresh")
+        except Exception as exc:
+            logger.warning(f"[recovery] Could not restore state: {exc} — fresh start")
 
+    def _persist_state(self) -> None:
+        """Snapshot current state to disk (runs in executor thread)."""
+        try:
+            with self._state_lock:
+                snapshot = {
+                    "active_entities": dict(self._state["active_entities"]),
+                    "current_entities": list(self._state["current_entities"]),
+                    "memories": list(self._state["memories"]),
+                    "_persisted_at": datetime.now().isoformat(),
+                }
+            self._disk_ctx.save(snapshot)
+        except Exception as exc:
+            logger.warning(f"[persist] Disk write failed: {exc}")
 
-if __name__ == "__main__":
-    main()
+    # =========================================================================
+    # HELPERS
+    # =========================================================================
+
+    def _safe_log(self, role: str, content: str) -> None:
+        """Log conversation turn with full error suppression."""
+        try:
+            self.conversation_logger.log_message(role, content)
+        except Exception as exc:
+            logger.warning(f"[log] Conversation logging failed: {exc}")
+
+    def __del__(self) -> None:
+        """Best-effort cleanup on GC — do not rely on this for correctness."""
+        try:
+            if hasattr(self, "_executor"):
+                self._executor.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            pass

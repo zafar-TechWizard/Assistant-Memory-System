@@ -133,32 +133,54 @@ class Neo4jClient:
     @asynccontextmanager
     async def transaction(self, database: Optional[str] = None):
         """
-        Context manager for database transactions with automatic rollback on error.
+        Async context manager for database transactions.
+
+        Yields an AsyncTransaction.  Commits on clean exit, rolls back on any
+        exception.  The session is guaranteed to close in all cases.
         """
         if not self._is_connected:
             raise ConnectionError("Not connected to Neo4j database")
-        
+
         database = database or self.config.database
-        session = self.driver.session(database=database)
-        transaction = await session.begin_transaction()
-        
-        try:
-            yield transaction
-            await transaction.commit()
-        except Exception as e:
-            await transaction.rollback()
-            logger.error(f"Transaction rolled back due to error: {e}")
-            raise
-        finally:
-            await session.close()
+
+        # Use async-with so the session is ALWAYS closed (even on exception)
+        async with self.driver.session(database=database) as session:
+            transaction = await session.begin_transaction()
+            try:
+                yield transaction
+                await transaction.commit()
+            except Exception as exc:
+                await transaction.rollback()
+                logger.error(f"Transaction rolled back: {exc}")
+                raise
     
     async def create_constraints_and_indexes(self) -> None:
         """Create necessary constraints and indexes for optimal performance"""
         
         # This is the fix for Gap #3.
-        vector_index_query = """
-        CREATE VECTOR INDEX memory_vector_index IF NOT EXISTS
-        FOR (n:ExperienceMemory|KnowledgeMemory|RelationshipMemory)
+        vector_index_query_exp = """
+        CREATE VECTOR INDEX experience_vector_index IF NOT EXISTS
+        FOR (n:ExperienceMemory)
+        ON (n.content_vector) 
+        OPTIONS {indexConfig: {
+            `vector.dimensions`: 384,
+            `vector.similarity_function`: 'cosine'
+        }}
+        """
+
+        vector_index_query_kno = """
+        CREATE VECTOR INDEX knowledge_vector_index IF NOT EXISTS
+        FOR (n:KnowledgeMemory)
+        ON (n.content_vector) 
+        OPTIONS {indexConfig: {
+            `vector.dimensions`: 384,
+            `vector.similarity_function`: 'cosine'
+        }}
+        """
+
+        vector_index_query_rel = """
+        CREATE VECTOR INDEX relationship_vector_index IF NOT EXISTS
+        FOR (n:RelationshipMemory)
         ON (n.content_vector) 
         OPTIONS {indexConfig: {
             `vector.dimensions`: 384,
@@ -168,7 +190,9 @@ class Neo4jClient:
         
         constraints_and_indexes = [
             # --- VECTOR INDEX ---
-            vector_index_query,
+            vector_index_query_exp,
+            vector_index_query_kno,
+            vector_index_query_rel,
             
             # Memory node constraints
             "CREATE CONSTRAINT experience_memory_id_unique IF NOT EXISTS FOR (e:ExperienceMemory) REQUIRE e.id IS UNIQUE",
@@ -264,9 +288,19 @@ class Neo4jClient:
             return {"error": str(e)}
     
     def __del__(self):
-        """Cleanup on object destruction"""
+        """
+        Log a warning if the client is garbage-collected without being
+        explicitly disconnected.
+
+        asyncio.create_task() is unsafe here (no guarantee a loop is running
+        during GC).  Always call `await client.disconnect()` explicitly from
+        memory_manager.shutdown().
+        """
         if self.driver and self._is_connected:
-            asyncio.create_task(self.disconnect())
+            logger.warning(
+                "Neo4jClient was garbage-collected while still connected. "
+                "Call `await client.disconnect()` before discarding the client."
+            )
 
 
 # Factory function for creating Neo4j client

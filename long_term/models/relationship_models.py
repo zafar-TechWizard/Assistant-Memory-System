@@ -11,7 +11,13 @@ from datetime import datetime
 from enum import Enum
 from uuid import uuid4, UUID
 
-from pydantic import BaseModel, Field, validator, root_validator
+# ── Pydantic v1 / v2 compatibility ──────────────────────────────────────────
+try:
+    from pydantic.v1 import BaseModel, Field, validator, root_validator
+except ImportError:
+    from pydantic import BaseModel, Field, validator, root_validator  # type: ignore
+# ─────────────────────────────────────────────────────────────────────────────
+
 from .node_models import MemoryContext
 
 

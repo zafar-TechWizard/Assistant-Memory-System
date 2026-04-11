@@ -404,19 +404,19 @@ class MemoryRetrievalEngine:
     ) -> List[Dict[str, Any]]:
         """
         Search memories by semantic meaning (not just keywords).
-        
+
         Uses vector embeddings to find memories with similar meaning,
         even if they use different words.
-        
+
         Args:
             query_text: Natural language query
             top_k: Number of most similar memories to return
             include_connected: Whether to also return connected memories
             max_hops: If include_connected=True, how many hops to traverse
-            
+
         Returns:
             List of memory dictionaries with similarity scores
-            
+
         Example:
             ```python
             # Will find "father", "dad", "parent", etc.
@@ -426,9 +426,20 @@ class MemoryRetrievalEngine:
             )
             ```
         """
-        # Generate embedding for query
-        query_vector = self.embed_util.generate_embedding(query_text)
-        
+        import asyncio as _asyncio
+
+        # ── CRITICAL: run the synchronous, CPU-bound embedding in a thread ────
+        # Without this, generate_embedding() blocks the event loop, preventing
+        # every other coroutine inside asyncio.gather() from making progress.
+        # run_in_executor() offloads to the default ThreadPoolExecutor so the
+        # event loop stays free for concurrent Neo4j queries.
+        loop = _asyncio.get_running_loop()
+        query_vector = await loop.run_in_executor(
+            None,                              # default executor
+            self.embed_util.generate_embedding,
+            query_text,
+        )
+
         if include_connected:
             query = f"""
             CALL db.index.vector.queryNodes(
@@ -437,10 +448,10 @@ class MemoryRetrievalEngine:
                 $query_vector
             )
             YIELD node, score
-            
+
             OPTIONAL MATCH (node)-[r:MEMORY_RELATIONSHIP*1..{max_hops}]-(connected)
-            
-            RETURN 
+
+            RETURN
                 node.id as id,
                 node.content as content,
                 labels(node) as type,
@@ -466,7 +477,7 @@ class MemoryRetrievalEngine:
                 $query_vector
             )
             YIELD node, score
-            RETURN 
+            RETURN
                 node.id as id,
                 node.content as content,
                 labels(node) as type,
@@ -475,12 +486,14 @@ class MemoryRetrievalEngine:
             ORDER BY score DESC
             """
             parameters = {'top_k': top_k, 'query_vector': query_vector}
-        
+
         results = await self.client.execute_query(query, parameters)
         logger.info(
             f"Semantic search for '{query_text}' returned {len(results)} results"
         )
         return results
+
+
     
     # ========================================================================
     # GROUPED RETRIEVAL METHODS
@@ -1014,7 +1027,7 @@ class MemoryRetrievalEngine:
             # Results sorted by: strength × importance × confidence
             ```
         """
-        strength_filter = "" if include_weak_connections else "AND r.strength >= 0.5"
+        strength_filter = "" if include_weak_connections else "WHERE r.strength >= 0.5"
         
         query = f"""
         MATCH (root)

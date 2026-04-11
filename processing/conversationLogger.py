@@ -1,5 +1,6 @@
 import json
 import os
+import threading
 from pathlib import Path
 from datetime import datetime, timedelta
 from uuid import uuid4
@@ -26,30 +27,26 @@ class ConversationLogger:
             filepath: Path to conversation log file (defaults to config value)
             session_timeout_minutes: Session timeout in minutes (defaults to config value)
         """
-        # Load configuration
-        wm_config = config.get("working_memory", {})
-        base_path = Path(config.get("base_path", "."))
-        
         # Set user ID
-        self.user = user_id or config.get("user_id", "default_user")
+        self.user = user_id or getattr(config, "user_id", "default_user")
         
         # Set filepath
         if filepath:
             self.filepath = filepath
         else:
-            conversation_log_file = wm_config.get(
-                "conversation_log_file",
-                "memory/data/conversation.json"
-            )
-            self.filepath = str(base_path / conversation_log_file)
+            self.filepath = str(getattr(config, "conversation_log_path", "memory/data/conversation.json"))
         
         # Set session timeout
-        timeout_minutes = session_timeout_minutes or wm_config.get("session_timeout_minutes", 30)
+        timeout_minutes = session_timeout_minutes or getattr(config, "session_timeout_minutes", 30)
         self.session_timeout = timedelta(minutes=timeout_minutes)
         
         # Ensure directory exists
         os.makedirs(os.path.dirname(self.filepath), exist_ok=True)
-        
+
+        # Thread-safety: prevents write race when two executor threads call
+        # log_message() simultaneously (load-modify-save race condition).
+        self._lock = threading.Lock()
+
         logger.info(
             f"ConversationLogger initialized: user={self.user}, "
             f"filepath={self.filepath}, timeout={timeout_minutes}min"
@@ -89,11 +86,19 @@ class ConversationLogger:
     def log_message(self, role: str, content: str):
         """
         Logs a new message for a user, handling session logic.
-        
+
+        Thread-safe: acquires _lock so concurrent calls from a ThreadPoolExecutor
+        do not produce a load-modify-save race that silently drops messages.
+
         Args:
             role: Message role (user/assistant/system)
             content: Message content
         """
+        with self._lock:
+            self._log_message_locked(role, content)
+
+    def _log_message_locked(self, role: str, content: str):
+        """Internal implementation — must only be called while _lock is held."""
         all_data = self._load_data()
         now = datetime.utcnow()
 
@@ -134,6 +139,7 @@ class ConversationLogger:
         all_data[user_key] = user_sessions
         self._save_data(all_data)
         logger.debug(f"Logged message for {self.user} in role {role}")
+        # (lock released by context manager in log_message)
     
     def get_current_session(self) -> dict:
         """

@@ -11,8 +11,18 @@ from datetime import datetime
 from enum import Enum
 from uuid import uuid4, UUID
 
-from pydantic import BaseModel, Field, validator, root_validator
-import logging # Import logger for validation warnings
+# ── Pydantic v1 / v2 compatibility ──────────────────────────────────────────
+# Pydantic v2 ships a bundled v1 back-compat layer at `pydantic.v1`.
+# We always import from there if available so `@validator` / `@root_validator`
+# and `class Config` work correctly on both versions.
+try:
+    from pydantic.v1 import BaseModel, Field, validator, root_validator
+except ImportError:
+    from pydantic import BaseModel, Field, validator, root_validator  # type: ignore
+# ─────────────────────────────────────────────────────────────────────────────
+
+import logging  # Import logger for validation warnings
+
 
 logger = logging.getLogger(__name__)
 

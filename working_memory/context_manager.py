@@ -1,121 +1,115 @@
-import time
+"""
+SOFi Working Context Manager — Thread-Safe Disk Persistence
+
+Responsibilities:
+  - Provide a thread-safe load() / save() interface for the working_context.json file.
+  - Use an atomic write (write-to-temp-then-rename) so a crash mid-write never
+    leaves a corrupt file.
+  - NOT responsible for in-memory caching — that lives in WorkingMemory._state.
+  - NOT polled.  WorkingMemory writes here periodically for crash recovery only.
+"""
+
 import json
+import os
 from pathlib import Path
-from typing import List, Dict, Any, Optional, Set
-from dataclasses import dataclass, asdict
-from datetime import datetime, timedelta
 from threading import Lock
-from contextlib import contextmanager
+from typing import Any, Dict
+
 from utils.logger import UniversalLogger
 
-
 logger = UniversalLogger.get_logger("working_memory")
+
+# Minimum structure guaranteed to exist in every loaded context
+_DEFAULTS: Dict[str, Any] = {
+    "active_entities": {},
+    "current_entities": [],
+    "memories": [],
+}
 
 
 class WorkingContextManager:
     """
-    Manages reading and writing to the working_context file.
-    Provides thread-safe operations and error handling.
+    Handles reading and writing the working_context.json file.
+
+    Thread-safe: a single threading.Lock serialises all I/O so concurrent
+    executor threads (persist + restore) do not race.
+
+    Atomic writes: data is first written to a .tmp sibling file, then renamed
+    over the real file.  On POSIX this rename is atomic; on Windows it's a
+    best-effort replace (os.replace) which is also safe against partial writes.
     """
-    
+
     def __init__(self, file_path: Path):
-        """
-        Initialize the context manager.
-        
-        Args:
-            file_path: Path to the working_context file
-        """
-        self.file_path = file_path
+        self.file_path = Path(file_path)
         self._lock = Lock()
         self._ensure_file_exists()
-    
-    def _ensure_file_exists(self):
-        """Ensure the working context file exists with proper structure."""
-        if not self.file_path.exists():
-            logger.warning(f"Working context file not found. Creating: {self.file_path}")
-            self.file_path.parent.mkdir(parents=True, exist_ok=True)
-            
-            initial_data = {
-                "active_entities": {},
-                "current_entities": [],
-                "memories": []
-            }
-            
-            with open(self.file_path, 'w', encoding='utf-8') as f:
-                json.dump(initial_data, f, indent=2)
-    
-    @contextmanager
-    def _file_lock(self):
-        """Context manager for thread-safe file operations."""
-        self._lock.acquire()
-        try:
-            yield
-        finally:
-            self._lock.release()
-    
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Public API
+    # ──────────────────────────────────────────────────────────────────────────
+
     def load(self) -> Dict[str, Any]:
         """
-        Load working context from file.
-        
+        Load working context from disk.
+
         Returns:
-            Dictionary containing the working context
-            
+            Dict with at least the keys from _DEFAULTS.  Any missing keys are
+            filled in with empty defaults so callers never KeyError.
+
         Raises:
-            IOError: If file cannot be read
-            json.JSONDecodeError: If file contains invalid JSON
+            FileNotFoundError: if the file genuinely does not exist yet.
+            json.JSONDecodeError: if the file is corrupt.
         """
-        with self._file_lock():
-            try:
-                with open(self.file_path, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                
-                # Ensure required keys exist
-                if "active_entities" not in data:
-                    data["active_entities"] = {}
-                if "current_entities" not in data:
-                    data["current_entities"] = []
-                if "memories" not in data:
-                    data["memories"] = []
-                
-                logger.debug(f"Loaded working context: {len(data.get('active_entities', {}))} active entities")
-                return data
-                
-            except FileNotFoundError:
-                logger.error(f"Working context file not found: {self.file_path}")
-                raise
-            except json.JSONDecodeError as e:
-                logger.error(f"Invalid JSON in working context file: {e}")
-                raise
-            except Exception as e:
-                logger.error(f"Error loading working context: {e}")
-                raise
-    
-    def save(self, data: Dict[str, Any]):
+        with self._lock:
+            with open(self.file_path, "r", encoding="utf-8") as fh:
+                data: Dict[str, Any] = json.load(fh)
+
+        # Back-fill any missing top-level keys
+        for key, default_val in _DEFAULTS.items():
+            if key not in data:
+                data[key] = type(default_val)()
+
+        logger.debug(
+            f"[ctx_mgr] Loaded — "
+            f"{len(data.get('active_entities', {}))} active entities, "
+            f"{len(data.get('memories', []))} memories"
+        )
+        return data
+
+    def save(self, data: Dict[str, Any]) -> None:
         """
-        Save working context to file.
-        
+        Atomically save working context to disk.
+
+        Writes to a .tmp file first, then renames over the real file to
+        guarantee the real file is never left in a partial state.
+
         Args:
-            data: Dictionary containing the working context
-            
-        Raises:
-            IOError: If file cannot be written
+            data: The full working context dict to persist.
         """
-        with self._file_lock():
-            try:
-                # Create backup before writing
-                if self.file_path.exists():
-                    backup_path = self.file_path.with_suffix('.json.bak')
-                    with open(self.file_path, 'r', encoding='utf-8') as f:
-                        backup_data = f.read()
-                    with open(backup_path, 'w', encoding='utf-8') as f:
-                        f.write(backup_data)
-                
-                # Write new data
-                with open(self.file_path, 'w', encoding='utf-8') as f:
-                    json.dump(data, f, indent=2, ensure_ascii=False)
-                
-                logger.debug(f"Saved working context: {len(data.get('active_entities', {}))} active entities")
-                
-            except Exception as e:
-                logger.error(f"Error saving working context: {e}")
-                raise
+        tmp_path = self.file_path.with_suffix(".tmp")
+
+        with self._lock:
+            # Write to temp file
+            with open(tmp_path, "w", encoding="utf-8") as fh:
+                json.dump(data, fh, indent=2, ensure_ascii=False, default=str)
+
+            # Atomic replace (safe on both POSIX and Windows)
+            os.replace(tmp_path, self.file_path)
+
+        logger.debug(
+            f"[ctx_mgr] Saved — "
+            f"{len(data.get('active_entities', {}))} active entities, "
+            f"{len(data.get('memories', []))} memories"
+        )
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Private helpers
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def _ensure_file_exists(self) -> None:
+        """Create the file with empty defaults if it doesn't exist yet."""
+        if not self.file_path.exists():
+            logger.info(f"[ctx_mgr] Creating new context file: {self.file_path}")
+            self.file_path.parent.mkdir(parents=True, exist_ok=True)
+            # Use save() so we get atomic write from day one
+            self.save(dict(_DEFAULTS))

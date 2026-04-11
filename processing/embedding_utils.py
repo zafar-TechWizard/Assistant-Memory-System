@@ -4,6 +4,9 @@
 from sentence_transformers import SentenceTransformer
 from typing import List
 import numpy as np
+import logging
+
+logger = logging.getLogger(__name__)
 
 class EmbeddingUtils:
     """
@@ -17,11 +20,11 @@ class EmbeddingUtils:
 
     @classmethod
     def _get_model(cls) -> SentenceTransformer:
-        """Loads the sentence transformer model into memory."""
+        """Loads the sentence transformer model into memory (once)."""
         if cls._model is None:
-            print(f"Loading embedding model '{cls._model_name}' into memory...")
+            logger.info(f"Loading embedding model '{cls._model_name}'…")
             cls._model = SentenceTransformer(cls._model_name)
-            print("Embedding model loaded successfully.")
+            logger.info("Embedding model loaded.")
         return cls._model
 
     @classmethod

@@ -1,162 +1,281 @@
+"""
+SOFi Memory Manager — Central Orchestrator
+
+Wires together the 3-tier cognitive architecture:
+  L1: WorkingMemory   — in-memory active state (the whiteboard)
+  L2: Neo4j Graph     — long-term persistent memory
+  Processing:         — entity extraction, conversation logging, embeddings
+
+Usage:
+    manager = MemoryManager()
+    await manager.setup()
+
+    # On every incoming message:
+    await manager.observe("user", "...")
+
+    # Before LLM generates its response:
+    ctx = manager.get_context("user", "...")
+    # ctx is a dict → pass to prompt builder
+
+    await manager.shutdown()
+"""
+
 import asyncio
 import logging
 from typing import Dict, Any, Optional
 
-# The Components 
 from memory.working_memory.working_mem import WorkingMemory
+from memory.working_memory.working_context import WorkingContextManager
+from memory.working_memory.workspace_watcher import WorkspaceWatcher
 from memory.long_term.infrastructure.neo4j_client import create_neo4j_client
 from memory.long_term.infrastructure.docker_manager import DockerManager
 from memory.long_term.memory_retrieval_engine import MemoryRetrievalEngine
-from memory.processing.conversationLogger import ConversationLogger
+from memory.long_term.memory_router import MemoryRouter
 from memory.processing.embedding_utils import EmbeddingUtils
 from memory.config import config
 
 from utils.logger import UniversalLogger
 
-logger = UniversalLogger.get_logger("memory")
+logger = UniversalLogger.get_logger("memory_manager")
+
 
 class MemoryManager:
     """
-    The Main Interface for the Memory System.
+    Central orchestrator for the SOFi Memory System.
+
+    Public surface:
+        await setup()               — boot everything
+        await observe(role, text)   — ingest a message (non-blocking)
+        get_context(role, text)     — get SOFi's current awareness dict
+        await shutdown()            — graceful close
     """
 
     def __init__(self):
         self.config = config
-        self.is_initialized = False
+        self.is_initialized: bool = False
 
-        self.active_entities = {}
-        self.current_entities = []
-        
-        # Components
-        self.docker_manager = None
-        self.logger = None
-        self.l2_client = None
-        self.retriever = None
-        self.working_memory = None
+        # Components (set during setup())
+        self.docker_manager:   Optional[DockerManager]         = None
+        self.l2_client                                         = None
+        self.retriever:        Optional[MemoryRetrievalEngine] = None
+        self.router:           Optional[MemoryRouter]          = None
+        self.working_memory:   Optional[WorkingMemory]         = None
+        self.context_manager:  Optional[WorkingContextManager] = None
+        self._watcher:         Optional[WorkspaceWatcher]      = None
+
+    # =========================================================================
+    # BOOT
+    # =========================================================================
 
     async def setup(self):
         """
-        Boot sequence: Connects DBs, loads models, prepares the system.
-        """
-        logger.info("Starting Memory System Setup...")
+        Boot sequence — must be awaited once before any other call.
 
-        # 0. Setup Docker Manager and ensure Neo4j is running
+        Steps:
+          0. Start Docker container for Neo4j (idempotent)
+          1. Connect Neo4j and create schema (indexes + constraints)
+          2. Build embedding utility and retrieval engine
+          3. Build working memory, wired to the retrieval engine
+        """
+        logger.info("=" * 50)
+        logger.info("SOFi Memory System — Booting")
+        logger.info("=" * 50)
+
+        # 0. Docker / Neo4j health ─────────────────────────────────────────
         self.docker_manager = DockerManager()
-        
         try:
-            # Start Docker container (idempotent - safe to call multiple times)
             self.docker_manager.start_docker()
-            
-            # Ensure Neo4j is ready to accept connections
-            self.docker_manager.ensure_connection()
+            await self.docker_manager.ensure_connection_async()
         except Exception as e:
             raise RuntimeError(
-                "Failed to start Neo4j Docker container. "
-                "Please ensure Docker Desktop is running. Error: {e}"
-            )
+                f"Neo4j Docker startup failed. "
+                f"Ensure Docker Desktop is running. Detail: {e}"
+            ) from e
 
-        # 1. Setup Logging (For the 'Dreaming' process later)
-        self.logger = ConversationLogger(
-            user_id=self.config.user_id,
-            filepath=str(self.config.conversation_log_path)
-        )
-
-        # 2. Setup Long Term Memory (L2) Infrastructure
+        # 1. Long-Term Memory (L2) ─────────────────────────────────────────
+        logger.info("Connecting to Neo4j…")
         self.l2_client = create_neo4j_client(
             uri=self.config.neo4j_uri,
             username=self.config.neo4j_username,
             password=self.config.neo4j_password,
-            database=self.config.database
+            database=self.config.database,
+            # Sized for 15-20 concurrent router queries (Tier1+Tier2+backup)
+            # plus headroom for spikes.  Each route() dispatches up to ~8
+            # concurrent Cypher queries; pool of 30 covers 3 overlapping messages.
+            max_connection_pool_size=30,
         )
         await self.l2_client.connect()
-        
-        # 3. Setup Retrieval Engine (The Bridge between L1 and L2)
+
+        # Create vector index + uniqueness constraints (idempotent)
+        logger.info("Ensuring Neo4j schema (indexes + constraints)…")
+        await self.l2_client.create_constraints_and_indexes()
+
+        # 2. Retrieval Engine ──────────────────────────────────────────────
+        logger.info("Loading embedding model…")
+        embed = EmbeddingUtils()
+
         self.retriever = MemoryRetrievalEngine(
             neo4j_client=self.l2_client,
-            embedding_utils=EmbeddingUtils() 
+            embedding_utils=embed,
         )
 
-        # 4. Setup Working Memory (The Processor)
+        # 3. Memory Router (intent classifier + tiered dispatch) ──────────────
+        logger.info("Initialising MemoryRouter…")
+        self.router = MemoryRouter(engine=self.retriever)
+
+        # 4. Working Context Manager (single source of truth) ─────────────────
+        logger.info("Initialising WorkingContextManager…")
+        self.context_manager = WorkingContextManager()
+
+        # 5. Working Memory (L1) ───────────────────────────────────────────────
+        loop = asyncio.get_running_loop()
         self.working_memory = WorkingMemory(
             user_id=self.config.user_id,
-            retrieval_engine=self.retriever
+            retrieval_engine=self.retriever,
+            memory_router=self.router,
+            context_manager=self.context_manager,
+            event_loop=loop,
         )
+
+        # 6. WorkspaceWatcher (proactive notification monitor) ─────────────────
+        logger.info("Starting WorkspaceWatcher…")
+        self._watcher = WorkspaceWatcher(
+            context_manager=self.context_manager,
+            proactive_callback=self._on_proactive_notification,
+        )
+        self._watcher.start()
 
         self.is_initialized = True
-        logger.info("Memory System Ready.")
+        logger.info("=" * 50)
+        logger.info("SOFi Memory System — Ready ✓")
+        logger.info("=" * 50)
 
-    async def observe(self, role: str, content: str):
+    # =========================================================================
+    # OBSERVE  (input gate)
+    # =========================================================================
+
+    async def observe(self, role: str, content: str) -> None:
         """
-        Input Method: Takes a signal, logs it, and processes it into Working Context.
+        Observe a new message.
+
+        Fires reactive_processing in a background thread and returns immediately.
+        Also records user activity so WorkspaceWatcher can track conversation gaps.
+
+        Args:
+            role:    "user" | "assistant" | "system"
+            content: The message text.
         """
-        if not self.is_initialized:
-            raise RuntimeError("Memory System not initialized. Run await setup() first.")
+        self._require_initialized()
 
-
-        # Process into Working Memory (in background)
-        message = [{"role": role, "content": content}]
+        # Tell the watcher the user is active (resets gap timer)
+        if role == "user" and self._watcher:
+            self._watcher.record_user_activity()
 
         loop = asyncio.get_running_loop()
-
-        # Fire-and-forget background thread
-        asyncio.create_task(
-            loop.run_in_executor(
-                None,  # None = default ThreadPoolExecutor
-                self.working_memory.reactive_processing,
-                message
-            )
+        future = loop.run_in_executor(
+            None,
+            self.working_memory.reactive_processing,
+            role,
+            content,
         )
+        logger.debug(f"observe() dispatched background task (role={role})")
 
-        logger.info("Memory observed started in background.")
+    # =========================================================================
+    # GET CONTEXT  (output gate)
+    # =========================================================================
 
-
-    def get_context(self, role: str, message: str):
+    def get_context(self, role: str = "", message: str = "") -> Dict[str, Any]:
         """
-        Output Method: Returns the current state of the 'Mind' to the Assistant.
-        """
-        if not self.is_initialized:
-            raise RuntimeError("Memory System not initialized.")
+        Return SOFi's current working context snapshot.
 
+        Blocks for at most `context_retrieval_timeout_ms` milliseconds waiting
+        for in-flight reactive_processing to complete, then returns the state.
+
+        Returns a serialisable dict built from WorkingContextManager.snapshot().
+        """
+        self._require_initialized()
         return self.working_memory.get_working_context(role, message)
 
-    
-    async def shutdown(self, stop_docker: bool = False):
+    def get_full_context(self):
         """
-        Graceful shutdown.
-        
-        Args:
-            stop_docker: If True, stops the Docker container. Default False to leave it running.
+        Return the full WorkingContext dataclass snapshot — all four pillars.
+        Use this for rich access (e.g., to read tiered memories, sofi state, workspace).
         """
+        self._require_initialized()
+        return self.context_manager.snapshot()
+
+    # =========================================================================
+    # SHUTDOWN
+    # =========================================================================
+
+    async def shutdown(self, stop_docker: bool = False) -> None:
+        """Graceful shutdown — flush working memory, stop watcher, close connections."""
+        if self._watcher:
+            self._watcher.stop()
+
+        if self.working_memory:
+            self.working_memory.shutdown()
+
         if self.l2_client:
             await self.l2_client.disconnect()
-        
+
         if stop_docker and self.docker_manager:
-            logger.info("SHUTDOWN: Stopping Docker container...")
+            logger.info("Stopping Neo4j Docker container…")
             self.docker_manager.stop_docker()
-        
-        logger.info("SHUTDOWN: Memory System stopped.")
+
+        logger.info("SOFi Memory System — Shut down.")
+
+    # =========================================================================
+    # PROACTIVE CALLBACK (stub — replace with real SOFi activation)
+    # =========================================================================
+
+    def _on_proactive_notification(self, item) -> None:
+        """
+        Called by WorkspaceWatcher when a proactive notification fires.
+        Override this OR replace via dependency injection to activate SOFi.
+
+        Default behaviour: log the event (safe no-op until the main assistant
+        loop wires in a real activation callback).
+        """
+        logger.info(
+            f"[manager] PROACTIVE: '{item.title}' "
+            f"(type={item.type.value} source={item.source_agent})"
+        )
+
+    # =========================================================================
+    # HELPERS
+    # =========================================================================
+
+    def _require_initialized(self) -> None:
+        if not self.is_initialized:
+            raise RuntimeError(
+                "MemoryManager is not initialized. "
+                "Call `await manager.setup()` first."
+            )
 
 
-
-# --- Quick Test Block ---
-async def main():
+# ---------------------------------------------------------------------------
+# Quick smoke-test
+# ---------------------------------------------------------------------------
+async def _main():
     manager = MemoryManager()
     try:
         await manager.setup()
-        
-        # simulate input
-        await manager.observe("user", "I am working on the memory refactor.")
-        
-        # get context
-        ctx = manager.get_context("user", "I am working on the memory refactor.")
-        print("\n--- WORKING CONTEXT ---")
-        print(ctx.to_prompt_header())
-        
+
+        test_msg = "I am building the SOFi memory system with Python and Neo4j."
+        await manager.observe("user", test_msg)
+
+        # Give the background thread ~400ms to finish
+        await asyncio.sleep(0.4)
+
+        ctx = manager.get_context("user", test_msg)
+        print("\n=== WORKING CONTEXT ===")
+        import json
+        print(json.dumps(ctx, indent=2, default=str))
+
     finally:
         await manager.shutdown()
 
-        
-if __name__ == "__main__":
-    
 
-    asyncio.run(main())
+if __name__ == "__main__":
+    asyncio.run(_main())
