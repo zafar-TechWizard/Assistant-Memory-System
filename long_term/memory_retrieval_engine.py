@@ -15,21 +15,29 @@ Features:
 - Connection reinforcement
 """
 
+import math
 import logging
 from typing import List, Dict, Any, Optional
 from datetime import datetime
 from enum import Enum
 
-# Import your existing components
 from memory.long_term.infrastructure.neo4j_client import Neo4jClient
 from memory.processing.embedding_utils import EmbeddingUtils
 
 
 logger = logging.getLogger(__name__)
 
+# Filter appended to every retrieval WHERE clause.
+# Nodes marked superseded=true during consolidation (CONTRADICT operation) must
+# never surface in retrieval — the newer node supersedes them.
+# coalesce handles nodes that predate the field (treat absence as not superseded).
+_NOT_SUPERSEDED_m    = "AND NOT coalesce(m.superseded, false)"
+_NOT_SUPERSEDED_node = "AND NOT coalesce(node.superseded, false)"
+_NOT_SUPERSEDED_conn = "AND NOT coalesce(connected.superseded, false)"
+
 
 # ============================================================================
-# ENUMS AND CONSTANTS
+# ENUMS
 # ============================================================================
 
 class MemoryType(Enum):
@@ -52,6 +60,60 @@ class EmotionType(str, Enum):
     ANXIOUS = "anxious"
     STRESSED = "stressed"
     NEUTRAL = "neutral"
+
+
+# ============================================================================
+# SPREADING ACTIVATION CONSTANTS
+# ============================================================================
+
+# Baseline conductivity for each typed relationship.
+# Higher = energy transfers more readily across that edge type.
+BASE_WEIGHTS: Dict[str, float] = {
+    "CAUSED":                   0.90,
+    "RESULTED_IN":              0.90,
+    "TRIGGERED":                0.85,
+    "EXPERIENCE_CHAIN":         0.80,
+    "WITHIN_CONTEXT":           0.80,
+    "KNOWLEDGE_HIERARCHY":      0.70,
+    "EXPERIENCE_TO_KNOWLEDGE":  0.65,
+    "KNOWLEDGE_TO_EXPERIENCE":  0.65,
+    "CROSS_CONTEXT":            0.60,
+    "TEMPORAL":                 0.50,
+    "HAPPENED_BEFORE":          0.50,
+    "HAPPENED_AFTER":           0.50,
+    "CONCURRENT":               0.45,
+    "SIMILAR_TO":               0.15,  # deliberately low — prevents topic drift
+    "ASSOCIATED_WITH":          0.10,
+}
+
+# Edge types traversed per intent — only the conductivity paths relevant to that intent.
+# Using Intent.value strings (e.g. "entity") to avoid a circular import with memory_router.
+INTENT_EDGE_MAP: Dict[str, List[str]] = {
+    "entity": [
+        "EXPERIENCE_TO_RELATIONSHIP", "RELATIONSHIP_TO_EXPERIENCE",
+        "RELATIONSHIP_NETWORK", "EXPERIENCE_CHAIN",
+    ],
+    "factual": [
+        "EXPERIENCE_TO_KNOWLEDGE", "KNOWLEDGE_TO_EXPERIENCE",
+        "KNOWLEDGE_HIERARCHY", "SIMILAR_TO",
+    ],
+    "emotional": [
+        "INFLUENCED", "TRIGGERED", "CAUSED",
+        "EXPERIENCE_CHAIN",
+    ],
+    "temporal": [
+        "HAPPENED_BEFORE", "HAPPENED_AFTER", "CONCURRENT", "DURING",
+        "EXPERIENCE_CHAIN",
+    ],
+}
+
+# Per-intent boosts applied on top of BASE_WEIGHTS for specific edge types.
+INTENT_MULTIPLIERS: Dict[str, Dict[str, float]] = {
+    "entity":    {"RELATIONSHIP_NETWORK": 1.5,  "EXPERIENCE_TO_RELATIONSHIP": 1.5},
+    "factual":   {"EXPERIENCE_TO_KNOWLEDGE": 1.4, "KNOWLEDGE_HIERARCHY": 1.4},
+    "emotional": {"INFLUENCED": 1.5, "TRIGGERED": 1.4, "CAUSED": 1.3},
+    "temporal":  {"HAPPENED_BEFORE": 1.8, "HAPPENED_AFTER": 1.8, "CONCURRENT": 1.6},
+}
 
 
 # ============================================================================
@@ -123,12 +185,13 @@ class MemoryRetrievalEngine:
         
         query = f"""
         MATCH (m)
-        WHERE (m.content CONTAINS $topic
-           OR m.person_name = $topic
-           OR m.concept CONTAINS $topic
-           OR $topic IN m.participants)
+        WHERE (toLower(coalesce(m.content, "")) CONTAINS toLower($topic)
+           OR toLower(coalesce(m.person_name, "")) = toLower($topic)
+           OR toLower(coalesce(m.concept, "")) CONTAINS toLower($topic)
+           OR any(p IN coalesce(m.participants, []) WHERE toLower(p) = toLower($topic)))
+        {_NOT_SUPERSEDED_m}
         {type_filter}
-        RETURN 
+        RETURN
             m.id as id,
             labels(m) as type,
             m.content as content,
@@ -205,10 +268,57 @@ class MemoryRetrievalEngine:
         logger.info(f"Retrieved {len(results)} memories for {len(topics)} topics")
         return results
     
+    async def bm25_search(
+        self,
+        query_terms: List[str],
+        limit: int = 20,
+    ) -> List[Dict[str, Any]]:
+        """
+        BM25 keyword search via Neo4j Lucene full-text index (~10-20ms).
+        No embedding generation — uses a pre-built index on content, participants,
+        concept, person_name, and tags fields.
+
+        Args:
+            query_terms: Entity names or keywords to search for.
+            limit:        Maximum number of results.
+
+        Returns:
+            List of memory dicts with a bm25_score field added.
+        """
+        if not query_terms:
+            return []
+
+        query_string = " OR ".join(self._escape_lucene(t) for t in query_terms)
+
+        query = f"""
+        CALL db.index.fulltext.queryNodes("memory_fts", $query_string)
+        YIELD node, score
+        WHERE {_NOT_SUPERSEDED_node.lstrip("AND ")}
+        RETURN
+            node.id            AS id,
+            node.content       AS content,
+            labels(node)       AS type,
+            node.timestamp     AS timestamp,
+            node.emotional_tone AS emotional_tone,
+            node.participants  AS participants,
+            node.concept       AS concept,
+            node.person_name   AS person_name,
+            score              AS bm25_score
+        ORDER BY score DESC
+        LIMIT $limit
+        """
+
+        results = await self.client.execute_query(
+            query,
+            parameters={"query_string": query_string, "limit": limit},
+        )
+        logger.info(f"BM25 '{query_string}' → {len(results)} results")
+        return results
+
     # ========================================================================
     # GRAPH TRAVERSAL METHODS
     # ========================================================================
-    
+
     async def get_memories_with_connected_nodes(
         self,
         topic: str,
@@ -243,9 +353,10 @@ class MemoryRetrievalEngine:
         """
         query = f"""
         MATCH (root)
-        WHERE root.content CONTAINS $topic
-           OR root.person_name = $topic
-           OR $topic IN root.participants
+        WHERE toLower(coalesce(root.content, "")) CONTAINS toLower($topic)
+           OR toLower(coalesce(root.person_name, "")) = toLower($topic)
+           OR toLower(coalesce(root.concept, "")) CONTAINS toLower($topic)
+           OR any(p IN coalesce(root.participants, []) WHERE toLower(p) = toLower($topic))
         
         OPTIONAL MATCH path = (root)-[r:MEMORY_RELATIONSHIP*1..{max_hops}]-(connected)
         
@@ -390,7 +501,108 @@ class MemoryRetrievalEngine:
             f"around '{starting_memory_id}'"
         )
         return cluster
-    
+
+    async def _spreading_activation(
+        self,
+        entities: List[str],
+        intent: str,
+        budget: int,
+    ) -> List[Dict[str, Any]]:
+        """
+        Typed graph traversal with activation decay scoring.
+
+        Traversal steps:
+          1. Resolve entity strings to seed node IDs (no embedding).
+          2. Expand 2 hops using only the edge types for the given intent.
+          3. Score each reachable node: edge_weight × intent_multiplier
+             × temporal_decay × path_boost (soft lateral inhibition).
+          4. Return top-budget nodes sorted by activation score.
+
+        Args:
+            entities: Entity strings extracted from the message.
+            intent:   Intent.value string — selects which edge types to traverse.
+            budget:   Maximum nodes to return after scoring.
+        """
+        seed_ids = await self._resolve_seed_nodes(entities)
+        if not seed_ids:
+            return []
+
+        edge_types = INTENT_EDGE_MAP.get(intent, list(BASE_WEIGHTS.keys()))
+        rel_filter = "|".join(edge_types)
+        raw_limit  = min(budget * 3, 150)
+
+        # r is a list of relationships in a variable-length path.
+        # r[0] is the first (closest-to-seed) relationship — its type and strength
+        # are most representative of why this node was reached.
+        query = f"""
+        MATCH (seed) WHERE seed.id IN $seed_ids
+        MATCH (seed)-[r:{rel_filter}*1..2]-(connected)
+        WHERE connected.id <> seed.id
+          AND NOT coalesce(connected.superseded, false)
+        WITH connected,
+             collect(DISTINCT type(r[0]))           AS rel_types,
+             collect(coalesce(r[0].strength, 0.5))  AS strengths,
+             count(DISTINCT seed)                   AS path_count,
+             min(size(r))                           AS distance
+        RETURN
+            connected.id             AS id,
+            connected.content        AS content,
+            labels(connected)        AS type,
+            connected.timestamp      AS timestamp,
+            connected.emotional_tone AS emotional_tone,
+            connected.access_count   AS access_count,
+            connected.last_accessed  AS last_accessed,
+            rel_types[0]             AS rel_type,
+            strengths[0]             AS edge_strength,
+            distance,
+            path_count
+        ORDER BY path_count DESC, distance ASC
+        LIMIT $limit
+        """
+
+        rows = await self.client.execute_query(
+            query,
+            parameters={"seed_ids": seed_ids, "limit": raw_limit},
+        )
+
+        if not rows:
+            return []
+
+        intent_mults = INTENT_MULTIPLIERS.get(intent, {})
+        scored: List[tuple] = []
+
+        for node in rows:
+            rel_type  = node.get("rel_type") or ""
+            edge_w    = BASE_WEIGHTS.get(rel_type, 0.5)
+            mult      = intent_mults.get(rel_type, 1.0)
+
+            days_old = 0
+            raw_ts   = node.get("timestamp")
+            if raw_ts:
+                try:
+                    dt = datetime.fromisoformat(str(raw_ts).replace("Z", ""))
+                    days_old = max(0, (datetime.now() - dt.replace(tzinfo=None)).days)
+                except Exception:
+                    pass
+            decay = math.exp(-0.01 * days_old)
+
+            # Soft lateral inhibition: nodes reachable from multiple seeds are
+            # more likely to be genuinely relevant — boost without hard-filtering.
+            path_count = int(node.get("path_count") or 1)
+            path_boost = 1.0 + 0.25 * min(path_count - 1, 3)
+
+            activation = edge_w * mult * decay * path_boost
+            scored.append((activation, {**node, "activation_score": round(activation, 4)}))
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+        top = [m for _, m in scored[:budget]]
+
+        logger.info(
+            f"Spreading activation ({intent}): {len(entities)} entities → "
+            f"{len(rows)} candidates → {len(top)} returned"
+        )
+        return top
+
     # ========================================================================
     # SEMANTIC SEARCH METHODS
     # ========================================================================
@@ -636,8 +848,9 @@ class MemoryRetrievalEngine:
         query = f"""
         MATCH (m)
         WHERE m.timestamp > datetime() - duration({{days: $cutoff_days}})
+        {_NOT_SUPERSEDED_m}
         {topic_filter}
-        RETURN 
+        RETURN
             m.id as id,
             m.content as content,
             labels(m) as type,
@@ -689,8 +902,9 @@ class MemoryRetrievalEngine:
         MATCH (m)
         WHERE datetime(m.timestamp) >= datetime($start)
           AND datetime(m.timestamp) <= datetime($end)
+        {_NOT_SUPERSEDED_m}
         {topic_filter}
-        RETURN 
+        RETURN
             m.id as id,
             m.content as content,
             labels(m) as type,
@@ -785,9 +999,10 @@ class MemoryRetrievalEngine:
         
         query = f"""
         MATCH (m)
-        WHERE abs(m.emotional_tone) >= $min_emotion
+        WHERE abs(coalesce(m.emotional_tone, 0.0)) >= $min_emotion
+        {_NOT_SUPERSEDED_m}
         {topic_filter}
-        RETURN 
+        RETURN
             m.id as id,
             m.content as content,
             labels(m) as type,
@@ -800,7 +1015,54 @@ class MemoryRetrievalEngine:
         results = await self.client.execute_query(query, parameters)
         logger.info(f"Retrieved {len(results)} emotionally significant memories")
         return results
-    
+
+    async def get_recent_emotional_memories(
+        self,
+        days: int = 7,
+        topic: Optional[str] = None,
+        min_intensity: float = 0.3,
+        limit: int = 20,
+    ) -> List[Dict[str, Any]]:
+        """
+        Recency-first emotional scan: memories from the last N days ordered by
+        recency then intensity.
+
+        This mirrors human memory primacy — when someone says "I'm stressed,"
+        a close friend immediately filters recent events, not all-time records.
+        Lower intensity threshold (0.3 vs 0.5) because recent mild stress is
+        more relevant than ancient intense trauma.
+
+        ORDER BY: timestamp DESC (recency), then abs(emotional_tone) DESC (intensity)
+        """
+        topic_filter = self._build_topic_filter(topic, prefix="AND")
+        parameters = {
+            "min_emotion": min_intensity,
+            "days": days,
+            "limit": limit,
+        }
+        if topic:
+            parameters["topic"] = topic
+
+        query = f"""
+        MATCH (m)
+        WHERE m.timestamp >= datetime() - duration({{days: $days}})
+          AND abs(coalesce(m.emotional_tone, 0.0)) >= $min_emotion
+        {_NOT_SUPERSEDED_m}
+        {topic_filter}
+        RETURN
+            m.id              AS id,
+            m.content         AS content,
+            labels(m)         AS type,
+            m.timestamp       AS timestamp,
+            m.emotional_tone  AS emotional_tone,
+            m.participants    AS participants
+        ORDER BY m.timestamp DESC, abs(m.emotional_tone) DESC
+        LIMIT $limit
+        """
+        results = await self.client.execute_query(query, parameters)
+        logger.info(f"Retrieved {len(results)} recent emotional memories (last {days}d)")
+        return results
+
     async def get_memories_by_emotion(
         self,
         emotion: str,
@@ -897,11 +1159,11 @@ class MemoryRetrievalEngine:
         MATCH (m)
         {topic_filter}
         RETURN 
-            count(CASE WHEN m.emotional_tone >= 0.5 THEN 1 END) as positive_count,
-            count(CASE WHEN m.emotional_tone <= -0.5 THEN 1 END) as negative_count,
-            count(CASE WHEN m.emotional_tone > -0.5 AND m.emotional_tone < 0.5 THEN 1 END) as neutral_count,
-            avg(m.emotional_tone) as avg_emotional_tone,
-            max(abs(m.emotional_tone)) as max_intensity
+            count(CASE WHEN coalesce(m.emotional_tone, 0.0) >= 0.5 THEN 1 END) as positive_count,
+            count(CASE WHEN coalesce(m.emotional_tone, 0.0) <= -0.5 THEN 1 END) as negative_count,
+            count(CASE WHEN coalesce(m.emotional_tone, 0.0) > -0.5 AND coalesce(m.emotional_tone, 0.0) < 0.5 THEN 1 END) as neutral_count,
+            avg(coalesce(m.emotional_tone, 0.0)) as avg_emotional_tone,
+            max(abs(coalesce(m.emotional_tone, 0.0))) as max_intensity
         """
         
         results = await self.client.execute_query(query, parameters)
@@ -1031,18 +1293,19 @@ class MemoryRetrievalEngine:
         
         query = f"""
         MATCH (root)
-        WHERE root.content CONTAINS $topic
-           OR root.person_name = $topic
-           OR $topic IN root.participants
+        WHERE toLower(coalesce(root.content, "")) CONTAINS toLower($topic)
+           OR toLower(coalesce(root.person_name, "")) = toLower($topic)
+           OR toLower(coalesce(root.concept, "")) CONTAINS toLower($topic)
+           OR any(p IN coalesce(root.participants, []) WHERE toLower(p) = toLower($topic))
         
         MATCH (root)-[r:MEMORY_RELATIONSHIP]-(connected)
         {strength_filter}
         
         WITH 
             connected,
-            r.strength as connection_strength,
-            connected.importance_score as importance,
-            (r.strength * connected.importance_score * r.confidence) as weighted_relevance
+            coalesce(r.strength, 0.0) as connection_strength,
+            coalesce(connected.importance_score, 0.5) as importance,
+            (coalesce(r.strength, 0.0) * coalesce(connected.importance_score, 0.5) * coalesce(r.confidence, 1.0)) as weighted_relevance
         
         RETURN 
             connected.id as id,
@@ -1132,7 +1395,24 @@ class MemoryRetrievalEngine:
     # ========================================================================
     # UTILITY METHODS
     # ========================================================================
-    
+
+    async def ensure_fulltext_index(self) -> None:
+        """
+        Create the BM25 Lucene full-text index if it does not already exist.
+        Safe to call on every startup — the IF NOT EXISTS clause makes it idempotent.
+        Must be called before bm25_search() can be used.
+        """
+        query = """
+        CREATE FULLTEXT INDEX memory_fts IF NOT EXISTS
+        FOR (n:ExperienceMemory|KnowledgeMemory|RelationshipMemory)
+        ON EACH [n.content, n.participants, n.concept, n.person_name, n.tags]
+        """
+        try:
+            await self.client.execute_query(query)
+            logger.info("Full-text index 'memory_fts' ready")
+        except Exception as exc:
+            logger.warning(f"Full-text index creation returned: {exc}")
+
     async def get_memory_statistics(self) -> Dict[str, Any]:
         """
         Get statistics about the memory graph.
@@ -1193,9 +1473,10 @@ class MemoryRetrievalEngine:
             return ""
         
         return f"""
-        {prefix} (m.content CONTAINS $topic
-            OR m.person_name = $topic
-            OR $topic IN m.participants)
+        {prefix} (toLower(coalesce(m.content, "")) CONTAINS toLower($topic)
+            OR toLower(coalesce(m.person_name, "")) = toLower($topic)
+            OR toLower(coalesce(m.concept, "")) CONTAINS toLower($topic)
+            OR any(p IN coalesce(m.participants, []) WHERE toLower(p) = toLower($topic)))
         """
     
     def _build_multi_topic_conditions(
@@ -1207,7 +1488,10 @@ class MemoryRetrievalEngine:
         logic_operator = " AND " if match_all else " OR "
         
         conditions = logic_operator.join([
-            f"(m.content CONTAINS $topic{i} OR m.person_name = $topic{i} OR $topic{i} IN m.participants)"
+            f"(toLower(coalesce(m.content, \"\")) CONTAINS toLower($topic{i}) OR "
+            f"toLower(coalesce(m.person_name, \"\")) = toLower($topic{i}) OR "
+            f"toLower(coalesce(m.concept, \"\")) CONTAINS toLower($topic{i}) OR "
+            f"any(p IN coalesce(m.participants, []) WHERE toLower(p) = toLower($topic{i})))"
             for i in range(len(topics))
         ])
         
@@ -1222,22 +1506,54 @@ class MemoryRetrievalEngine:
     ) -> str:
         """Get Cypher filter for specific emotion type."""
         emotion_filters = {
-            "positive": "m.emotional_tone >= $min_intensity",
-            "negative": "m.emotional_tone <= -$min_intensity",
-            "happy": "m.emotional_tone >= 0.7",
-            "excited": "m.emotional_tone >= 0.8",
-            "proud": "m.emotional_tone >= 0.6",
-            "sad": "m.emotional_tone <= -0.6",
-            "angry": "m.emotional_tone <= -0.7",
-            "anxious": "m.emotional_tone <= -0.5",
-            "stressed": "m.emotional_tone <= -0.5",
-            "neutral": "m.emotional_tone > -0.3 AND m.emotional_tone < 0.3"
+            "positive": "coalesce(m.emotional_tone, 0.0) >= $min_intensity",
+            "negative": "coalesce(m.emotional_tone, 0.0) <= -$min_intensity",
+            "happy": "coalesce(m.emotional_tone, 0.0) >= 0.7",
+            "excited": "coalesce(m.emotional_tone, 0.0) >= 0.8",
+            "proud": "coalesce(m.emotional_tone, 0.0) >= 0.6",
+            "sad": "coalesce(m.emotional_tone, 0.0) <= -0.6",
+            "angry": "coalesce(m.emotional_tone, 0.0) <= -0.7",
+            "anxious": "coalesce(m.emotional_tone, 0.0) <= -0.5",
+            "stressed": "coalesce(m.emotional_tone, 0.0) <= -0.5",
+            "neutral": "coalesce(m.emotional_tone, 0.0) > -0.3 AND coalesce(m.emotional_tone, 0.0) < 0.3"
         }
         
         return emotion_filters.get(
             emotion.lower(),
-            "toLower(m.emotion_label) = toLower($emotion)"
+            "toLower(coalesce(m.emotion_label, \"\")) = toLower($emotion)"
         )
+
+    async def _resolve_seed_nodes(self, entities: List[str]) -> List[str]:
+        """
+        Resolve entity strings to Neo4j node IDs via direct property match.
+        No embedding — matches person_name, concept, or participants list.
+        Returns up to 3 matching node IDs per entity.
+        """
+        if not entities:
+            return []
+
+        seed_ids: List[str] = []
+        for entity in entities:
+            query = """
+            MATCH (seed)
+            WHERE toLower(coalesce(seed.person_name, "")) = toLower($entity)
+               OR toLower(coalesce(seed.concept, ""))     = toLower($entity)
+               OR any(p IN coalesce(seed.participants, [])
+                      WHERE toLower(p) = toLower($entity))
+            RETURN seed.id AS id
+            LIMIT 3
+            """
+            rows = await self.client.execute_query(query, parameters={"entity": entity})
+            seed_ids.extend(r["id"] for r in rows if r.get("id"))
+
+        logger.debug(f"Seed resolution: {entities} → {len(seed_ids)} node(s)")
+        return seed_ids
+
+    @staticmethod
+    def _escape_lucene(term: str) -> str:
+        """Escape Lucene special characters in a search term."""
+        special = set('+-&|!(){}[]^"~*?:\\/')
+        return "".join(f"\\{c}" if c in special else c for c in term)
 
 
 # ============================================================================

@@ -49,6 +49,7 @@ All methods on MemoryRetrievalEngine are used — mapped to tiers:
 """
 
 import asyncio
+import math
 import re
 import time
 import logging
@@ -58,6 +59,7 @@ from enum import Enum
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from utils.logger import UniversalLogger
+from memory.long_term import reranker as _reranker
 
 # Optional: dateparser for named day-of-week parsing ("last Tuesday")
 try:
@@ -550,11 +552,17 @@ class MemoryRouter:
 
         # ── 5. Phase C: Normalize → deduplicate → rank → package ─────────────
         all_results = phase_a + backup
-        must_know, context, associations = self._package(all_results, backup, eff_budget)
+        must_know, context, associations = self._package(
+            all_results, backup, eff_budget,
+            entities=entities, message=message, intent=ir.primary_intent.value,
+        )
 
-        # ── 6. Phase D: Fire-and-forget Hebbian reinforcement ──────────────────
+        # ── 6. Phase D: Fire-and-forget side-effects ───────────────────────────
+        surfaced = must_know + context + associations
         if all_results:
             asyncio.create_task(self._reinforce(all_results))
+        if surfaced:
+            asyncio.create_task(self._update_access_stats(surfaced))
 
         ms = (time.perf_counter() - t0) * 1000
         logger.info(
@@ -645,19 +653,51 @@ class MemoryRouter:
         ent0 = entities[0] if entities else None
         half = max(3, budget // 2)
 
-        if intent == Intent.ENTITY and ent0:
-            raw = await eng.get_memories_with_connected_nodes(
-                topic=ent0, max_hops=2, limit=half,
+        if intent == Intent.ENTITY and entities:
+            results = await eng._spreading_activation(
+                entities=entities, intent=intent.value, budget=budget,
             )
-            return self._normalize_connected(raw)
+            return self._tag_tier_hints(results)
 
         if intent == Intent.FACTUAL:
+            if entities:
+                # BM25 (lexical) + semantic (vector) run concurrently
+                bm25_res, sem_res = await asyncio.gather(
+                    eng.bm25_search(query_terms=entities, limit=half),
+                    eng.semantic_search(query_text=message, top_k=half),
+                    return_exceptions=True,
+                )
+                merged: List[Dict] = []
+                if not isinstance(bm25_res, Exception):
+                    merged.extend(bm25_res)
+                if not isinstance(sem_res, Exception):
+                    merged.extend(sem_res)
+                return merged
             return await eng.semantic_search(query_text=message, top_k=budget)
 
         if intent == Intent.EMOTIONAL:
-            return await eng.get_emotionally_significant_memories(
-                topic=ent0, min_emotional_intensity=0.5, limit=budget,
+            # Two concurrent queries — mirrors human recency primacy:
+            # 1) Recent window (last 7 days, lower threshold 0.3) — ordered by recency.
+            #    "What just happened that was intense?" surfaces first.
+            # 2) All-time significant (threshold 0.6) — ordered by intensity.
+            #    Historically significant emotional memories as background.
+            recent_task  = eng.get_recent_emotional_memories(
+                days=7, topic=ent0, min_intensity=0.3, limit=budget,
             )
+            intense_task = eng.get_emotionally_significant_memories(
+                topic=ent0, min_emotional_intensity=0.6, limit=budget,
+            )
+            recent_res, intense_res = await asyncio.gather(
+                recent_task, intense_task, return_exceptions=True
+            )
+            merged: List[Dict] = []
+            if not isinstance(recent_res, Exception):
+                for m in recent_res:
+                    m["_recency_boosted"] = True   # heat score gives extra weight
+                merged.extend(recent_res)
+            if not isinstance(intense_res, Exception):
+                merged.extend(intense_res)
+            return merged
 
         if intent == Intent.TEMPORAL:
             if ir.temporal_window:
@@ -694,21 +734,17 @@ class MemoryRouter:
         ent0 = entities[0] if entities else None
         half = max(3, budget // 2)
 
-        # ENTITY intent: add weighted-relevance alongside connected-nodes from T1
-        if ir.primary_intent == Intent.ENTITY and ent0:
-            return await eng.get_memories_with_weighted_relevance(
-                topic=ent0, limit=half,
-            )
+        # ENTITY intent: BM25 runs concurrently with spreading activation from T1
+        if ir.primary_intent == Intent.ENTITY and entities:
+            return await eng.bm25_search(query_terms=entities, limit=half)
 
-        # Multiple entities: OR-match across all of them
+        # Multiple entities: BM25 OR-match across all of them
         if len(entities) > 1:
-            return await eng.get_memories_by_multiple_topics(
-                topics=entities, match_all=False, limit=half,
-            )
+            return await eng.bm25_search(query_terms=entities, limit=half)
 
-        # Single entity: keyword fallback
+        # Single entity: BM25 keyword search
         if ent0:
-            return await eng.get_memories_by_topic(topic=ent0, limit=half)
+            return await eng.bm25_search(query_terms=[ent0], limit=half)
 
         # No entities: use memory hubs (most connected)
         return await eng.get_most_connected_memories(limit=max(3, half))
@@ -793,18 +829,44 @@ class MemoryRouter:
                     flat.append(connected)
         return flat
 
-    def _composite_score(self, m: Dict) -> float:
-        """
-        Composite relevance score:
-          0.50 × semantic_score  (from vector search; 0.5 default when absent)
-          0.30 × importance      (graph node field; 0.5 default)
-          0.20 × recency         (1 / (1 + days_old); exponential decay)
-        """
-        semantic   = float(m.get("score", 0.5))
-        importance = float(m.get("importance_score", 0.5))
+    # Temporal decay rate per intent.
+    # Higher lambda = steeper decay = recent memories dominate more strongly.
+    #   emotional 0.15 → 7 days ago scores exp(-1.05) ≈ 0.35× of today
+    #   temporal  0.10 → 7 days ago scores exp(-0.70) ≈ 0.50× of today
+    #   entity    0.05 → 7 days ago scores exp(-0.35) ≈ 0.70× of today  (default)
+    #   factual   0.02 → 7 days ago scores exp(-0.14) ≈ 0.87× of today  (facts don't age)
+    _INTENT_DECAY: Dict[str, float] = {
+        "emotional": 0.15,
+        "temporal":  0.10,
+        "entity":    0.05,
+        "factual":   0.02,
+        "ambient":   0.05,
+    }
 
-        recency = 0.5
-        raw_ts  = m.get("timestamp") or m.get("root_timestamp")
+    def _heat_score(self, memory: Dict, entities: List[str], intent: str = "entity") -> float:
+        """
+        ACT-R-inspired composite score with intent-aware temporal decay.
+
+          base          = log(1+access_count) × exp(-λ×days_since)   λ varies by intent
+          recency_bonus = up to +0.5 for memories ≤3 days old         (human primacy of recency)
+          recency_tag   = +0.3 if _recency_boosted flag set           (came from recent window scan)
+          assoc         = 0.3 × edge_strength
+          activation    = 0.4 × activation_score
+          bm25          = 0.1 × min(bm25_score, 5)
+          semantic      = 0.15 × vector_score
+          emotional     = 0.2 × abs(emotional_tone)
+
+        Rationale for intent-aware decay:
+          Emotional queries: yesterday's argument matters more than a historical one.
+          Factual queries: when Python was released doesn't get less true over time.
+        """
+        access_count = int(memory.get("access_count") or 1)
+        raw_ts = (
+            memory.get("last_accessed")
+            or memory.get("timestamp")
+            or memory.get("root_timestamp")
+        )
+        days_since = 0
         if raw_ts:
             try:
                 if _HAS_DATEPARSER:
@@ -812,32 +874,61 @@ class MemoryRouter:
                 else:
                     dt = datetime.fromisoformat(str(raw_ts).replace("Z", ""))
                 if dt:
-                    days_old = max(0, (datetime.now() - dt.replace(tzinfo=None)).days)
-                    recency  = 1.0 / (1.0 + days_old)
+                    days_since = max(0, (datetime.now() - dt.replace(tzinfo=None)).days)
             except Exception:
                 pass
 
-        return (semantic * 0.50) + (importance * 0.30) + (recency * 0.20)
+        decay_lambda = self._INTENT_DECAY.get(intent, 0.05)
+        base = math.log(1 + access_count) * math.exp(-decay_lambda * days_since)
+
+        # Recency bonus: memories ≤3 days old get an additive boost.
+        # At 0 days: +0.5. At 1 day: +0.33. At 2 days: +0.17. At 3+ days: 0.
+        # Reflects human working memory — very recent events are immediately available.
+        recency_bonus = max(0.0, (1.0 - days_since / 3.0) * 0.5) if days_since <= 3 else 0.0
+
+        # Extra boost for memories explicitly returned from the recent-window scan
+        if memory.get("_recency_boosted"):
+            recency_bonus += 0.3
+
+        edge_strength = min(float(memory.get("edge_strength") or 0.0), 1.0)
+        assoc_boost   = 0.3 * edge_strength
+
+        activation = min(float(memory.get("activation_score") or 0.0), 1.0) * 0.4
+        bm25       = min(float(memory.get("bm25_score") or 0.0), 5.0) * 0.1
+        semantic   = float(memory.get("score") or 0.0) * 0.15
+        emotional  = abs(float(memory.get("emotional_tone") or 0.0)) * 0.2
+
+        return base + recency_bonus + assoc_boost + activation + bm25 + semantic + emotional
 
     def _package(
         self,
         all_results: List[Dict],
         backup: List[Dict],
         budget: int,
+        entities: Optional[List[str]] = None,
+        message: str = "",
+        intent: str = "entity",
     ) -> Tuple[List[Dict], List[Dict], List[Dict]]:
         """
-        1. Score every result (composite_score, plus coverage boost)
+        1. Score every result with ACT-R heat score (intent-aware decay + recency bonus)
         2. Deduplicate by id
         3. Sort descending
-        4. Split: coverage-backed → must_know; _tier_hint='associations' → associations;
-                  top 1/3 of remainder → must_know; next → context; rest → associations
-        5. Hard-cap each tier
+        4. Cross-encoder rerank top-50 for semantic correctness
+        5. Split tiers:
+             _recency_boosted  → must_know  (recent window scan results always surface first)
+             _coverage_source  → must_know  (coverage-verified)
+             _tier_hint=assoc  → associations
+             top 1/3 of rest   → must_know
+             next 1/3          → context
+             bottom 1/3        → associations
+        6. Hard-cap each tier
         """
+        ents = entities or []
         backup_ids: Set[str] = {
             str(m.get("id", "")) for m in backup if m.get("id")
         }
 
-        seen:   Set[str]              = set()
+        seen:   Set[str]                 = set()
         scored: List[Tuple[float, Dict]] = []
 
         for m in all_results:
@@ -846,22 +937,55 @@ class MemoryRouter:
                 continue
             seen.add(mid)
 
-            score = self._composite_score(m)
-            # Coverage-verified memories always surface at the top
+            score = self._heat_score(m, ents, intent=intent)
+            # Coverage-verified memories always surface above un-retrieved candidates
             if mid in backup_ids or m.get("_coverage_source"):
-                score = max(score, 0.95)
+                score = max(score, 5.0)
             scored.append((score, m))
 
         scored.sort(key=lambda x: x[0], reverse=True)
         ordered = [m for _, m in scored]
 
-        # Separate by source
-        coverage_mems  = [m for m in ordered if m.get("_coverage_source") or str(m.get("id","")) in backup_ids]
-        assoc_hinted   = [m for m in ordered if m.get("_tier_hint") == "associations" and not m.get("_coverage_source")]
-        rest           = [m for m in ordered if m not in coverage_mems and m not in assoc_hinted]
+        # Cross-encoder rerank the top-50 for semantic precision (~10-15ms)
+        if message and ordered:
+            try:
+                top50    = ordered[:50]
+                rest_tail = ordered[50:]
+                ordered  = _reranker.rerank(message, top50, top_n=len(top50)) + rest_tail
+            except Exception as exc:
+                logger.debug(f"[router] Reranker skipped: {exc}")
+
+        # Separate by tier hint / coverage source / recency (O(1) ID-set checks)
+        def _mid(m: Dict) -> str:
+            return str(m.get("id") or m.get("root_id") or id(m))
+
+        # Recency-boosted: came from recent-window scan → always must_know
+        recency_ids: Set[str] = {
+            _mid(m) for m in ordered if m.get("_recency_boosted")
+        }
+        coverage_ids: Set[str] = {
+            _mid(m) for m in ordered
+            if (m.get("_coverage_source") or _mid(m) in backup_ids)
+            and _mid(m) not in recency_ids
+        }
+        priority_ids = recency_ids | coverage_ids
+        assoc_ids: Set[str] = {
+            _mid(m) for m in ordered
+            if m.get("_tier_hint") == "associations"
+            and _mid(m) not in priority_ids
+        }
+
+        recency_mems  = [m for m in ordered if _mid(m) in recency_ids]
+        coverage_mems = [m for m in ordered if _mid(m) in coverage_ids]
+        assoc_hinted  = [m for m in ordered if _mid(m) in assoc_ids]
+        rest = [
+            m for m in ordered
+            if _mid(m) not in priority_ids and _mid(m) not in assoc_ids
+        ]
 
         third = max(2, len(rest) // 3)
-        must_know    = coverage_mems + rest[:third]
+        # Recency memories always lead must_know — most mentally available first
+        must_know    = recency_mems + coverage_mems + rest[:third]
         context      = rest[third : third * 2]
         associations = assoc_hinted + rest[third * 2:]
 
@@ -871,6 +995,20 @@ class MemoryRouter:
         cap_assoc = max(5,  budget // 3)
 
         return must_know[:cap_must], context[:cap_ctx], associations[:cap_assoc]
+
+    @staticmethod
+    def _tag_tier_hints(memories: List[Dict]) -> List[Dict]:
+        """
+        Assign _tier_hint to spreading activation results based on graph distance.
+        Distance 1 (direct neighbour of seed) → context.
+        Distance 2 (two hops away) → associations.
+        Nodes with no distance field default to context.
+        """
+        for m in memories:
+            if m.get("_tier_hint"):
+                continue
+            m["_tier_hint"] = "associations" if m.get("distance", 1) >= 2 else "context"
+        return memories
 
     @staticmethod
     def _dedup(memories: List[Dict], seen: Optional[Set[str]] = None) -> List[Dict]:
@@ -916,3 +1054,36 @@ class MemoryRouter:
         ]
         await asyncio.gather(*tasks, return_exceptions=True)
         logger.debug(f"[router] Reinforced {len(tasks)} connections")
+
+    async def _update_access_stats(self, memories: List[Dict]) -> None:
+        """
+        Increment access_count and stamp last_accessed on every surfaced memory.
+        ACT-R frequency dimension — without this, heat scores ignore how often
+        a memory has been recalled, making frequently-useful memories rank
+        identically to memories that have never been retrieved.
+
+        Fire-and-forget via asyncio.create_task → zero latency impact.
+        One batched UNWIND query, not N individual queries.
+        """
+        ids = [
+            str(m.get("id") or m.get("root_id", ""))
+            for m in memories
+            if m.get("id") or m.get("root_id")
+        ]
+        if not ids:
+            return
+
+        query = """
+        UNWIND $ids AS node_id
+        MATCH (n {id: node_id})
+        SET n.access_count  = coalesce(n.access_count, 0) + 1,
+            n.last_accessed = $now
+        """
+        try:
+            await self._engine.client.execute_query(
+                query,
+                parameters={"ids": ids, "now": datetime.now().isoformat()},
+            )
+            logger.debug(f"[router] Updated access stats for {len(ids)} memories")
+        except Exception as exc:
+            logger.warning(f"[router] access_count update failed (non-fatal): {exc}")

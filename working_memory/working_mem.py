@@ -29,8 +29,9 @@ Key Design Decisions
   background thread without running a second event loop.
 - Entity expiry:  active entities older than entity_expiry_minutes are pruned
   from the whiteboard on every get_working_context() call.
-- Only NEW entities (first time seen this session) trigger LTM retrieval. Known
-  active entities just get their expiry refreshed.
+- Any non-AMBIENT intent triggers LTM retrieval — including EMOTIONAL queries
+  with no named entities ("I'm stressed"). AMBIENT intent is the only bypass.
+  Known entities get familiarity-gate treatment (0ms reuse if already loaded).
 - The memory list is capped at max_total_memories to prevent unbounded growth.
 """
 
@@ -209,75 +210,107 @@ class WorkingMemory:
             )
 
             # ── 3. LTM retrieval — router or fallback ─────────────────────────
-            if new_entities and self._loop:
-                routed = self._fetch_via_router(content, new_entities)
-                if routed is not None:
-                    with self._state_lock:
-                        self._state["tiered_memories"]["must_know"]    = routed.must_know
-                        self._state["tiered_memories"]["context"]      = routed.context
-                        self._state["tiered_memories"]["associations"] = routed.associations
-                        flat_new = routed.must_know + routed.context + routed.associations
-                        self._state["memories"] = self._merge_memories(
-                            self._state["memories"], flat_new
-                        )
-                        self._state["retrieval_meta"] = {
-                            "intent":        routed.intent.value,
-                            "confidence":    routed.confidence,
-                            "signals_fired": routed.signals_fired,
-                            "latency_ms":    routed.latency_ms,
-                        }
-                        self._state["emotional_baseline"] = routed.emotional_baseline
+            # Classify intent first (~0ms). Trigger LTM on any non-AMBIENT intent,
+            # not only when new entities appear — EMOTIONAL/TEMPORAL queries like
+            # "I'm stressed" have no new entities but still need long-term retrieval.
+            _ir = self._router.classify(content, list(entities)) if self._router else None
+            _non_ambient = _ir is not None and _ir.primary_intent.value != "ambient"
 
-                    # ── Push into WorkingContextManager (central state doc) ────
-                    if self._ctx_mgr:
-                        # Build recent_turns from ConversationLogger
-                        raw_turns = self.conversation_logger.get_conversation_history(
-                            max_turns=config.working_context_recent_turns * 2
-                        )
-                        recent_turns = [
-                            ConversationTurn(
-                                role=t["role"],
-                                content=t["content"],
-                                timestamp=datetime.fromisoformat(
-                                    t["timestamp"].replace("Z", "")
-                                ),
+            if _non_ambient and self._loop:
+                entities_list = list(entities)
+                _intent_val = _ir.primary_intent.value
+
+                # RF-Mem familiarity gate: if every entity is already warm AND
+                # has loaded memories, skip LTM entirely (0ms, no DB call).
+                if entities_list and self._is_familiarity_hit(entities_list, _intent_val):
+                    logger.info(
+                        f"[reactive] Familiarity hit — reusing loaded memories "
+                        f"{entities_list}"
+                    )
+                else:
+                    routed = self._fetch_via_router(content, entities)
+                    if routed is not None:
+                        flat_new = routed.must_know + routed.context + routed.associations
+                        # Tag memories so familiarity gate works on the next turn
+                        if entities_list:
+                            for idx, m in enumerate(flat_new):
+                                if not m.get("_trigger_entity"):
+                                    m["_trigger_entity"] = entities_list[
+                                        idx % len(entities_list)
+                                    ]
+                        with self._state_lock:
+                            self._state["tiered_memories"]["must_know"]    = routed.must_know
+                            self._state["tiered_memories"]["context"]      = routed.context
+                            self._state["tiered_memories"]["associations"] = routed.associations
+                            self._state["memories"] = self._merge_memories(
+                                self._state["memories"], flat_new
                             )
-                            for t in raw_turns[-config.working_context_recent_turns:]
-                        ]
-                        self._ctx_mgr.update_memory(
-                            must_know=routed.must_know,
-                            context=routed.context,
-                            associations=routed.associations,
-                            recent_turns=recent_turns,
-                            retrieval_meta={
+                            self._state["retrieval_meta"] = {
                                 "intent":        routed.intent.value,
                                 "confidence":    routed.confidence,
                                 "signals_fired": routed.signals_fired,
                                 "latency_ms":    routed.latency_ms,
-                            },
-                            emotional_baseline=routed.emotional_baseline,
-                        )
-                        # Update user state: which entities are currently in focus
-                        self._ctx_mgr.update_user_state(
-                            mentioned_entities=list(new_entities),
-                            current_focus=", ".join(list(new_entities)[:3]),
-                        )
+                            }
+                            self._state["emotional_baseline"] = routed.emotional_baseline
 
-                    logger.info(
-                        f"[reactive] Router: {routed.intent.value} "
-                        f"must_know={len(routed.must_know)} "
-                        f"context={len(routed.context)} "
-                        f"assoc={len(routed.associations)} "
-                        f"in {routed.latency_ms:.1f}ms"
-                    )
-                else:
-                    # Fallback: simple topic retrieval (router unavailable)
-                    fetched = self._fetch_from_longterm(new_entities)
-                    logger.info(f"[reactive] Fallback: {len(fetched)} memories retrieved")
-                    with self._state_lock:
-                        self._state["memories"] = self._merge_memories(
-                            self._state["memories"], fetched
+                        # ── Push into WorkingContextManager (central state doc) ──
+                        if self._ctx_mgr:
+                            raw_turns = self.conversation_logger.get_conversation_history(
+                                max_turns=config.working_context_recent_turns * 2
+                            )
+                            recent_turns = [
+                                ConversationTurn(
+                                    role=t["role"],
+                                    content=t["content"],
+                                    timestamp=datetime.fromisoformat(
+                                        t["timestamp"].replace("Z", "")
+                                    ),
+                                )
+                                for t in raw_turns[-config.working_context_recent_turns:]
+                            ]
+                            self._ctx_mgr.update_memory(
+                                must_know=routed.must_know,
+                                context=routed.context,
+                                associations=routed.associations,
+                                recent_turns=recent_turns,
+                                retrieval_meta={
+                                    "intent":        routed.intent.value,
+                                    "confidence":    routed.confidence,
+                                    "signals_fired": routed.signals_fired,
+                                    "latency_ms":    routed.latency_ms,
+                                },
+                                emotional_baseline=routed.emotional_baseline,
+                            )
+                            focus_entities = list(entities) if entities else list(new_entities)
+                            self._ctx_mgr.update_user_state(
+                                mentioned_entities=focus_entities,
+                                current_focus=", ".join(focus_entities[:3]),
+                            )
+
+                        logger.info(
+                            f"[reactive] Router: {routed.intent.value} "
+                            f"must_know={len(routed.must_know)} "
+                            f"context={len(routed.context)} "
+                            f"assoc={len(routed.associations)} "
+                            f"in {routed.latency_ms:.1f}ms"
                         )
+                    elif new_entities:
+                        # Router returned None (timeout/error) — fallback to direct retrieval
+                        fetched = self._fetch_from_longterm(new_entities)
+                        logger.info(f"[reactive] Fallback: {len(fetched)} memories retrieved")
+                        with self._state_lock:
+                            self._state["memories"] = self._merge_memories(
+                                self._state["memories"], fetched
+                            )
+
+            elif new_entities and self._loop:
+                # No router configured — direct retrieval for new entities only
+                fetched = self._fetch_from_longterm(new_entities)
+                logger.info(f"[reactive] Direct retrieval: {len(fetched)} memories")
+                with self._state_lock:
+                    self._state["memories"] = self._merge_memories(
+                        self._state["memories"], fetched
+                    )
 
             # ── 4. Non-critical, fire-and-forget ─────────────────────────────
             self._executor.submit(self._safe_log, role, content)
@@ -597,6 +630,24 @@ class WorkingMemory:
     # =========================================================================
     # HELPERS
     # =========================================================================
+
+    def _is_familiarity_hit(self, entities: List[str], intent_value: str) -> bool:
+        """
+        RF-Mem familiarity gate: returns True if every requested entity is already
+        warm in active_entities AND at least one loaded memory is tagged with it.
+
+        When True, the caller can skip LTM retrieval entirely (0ms, no DB call).
+        Always returns False for emotional and temporal intents — those need fresh
+        retrieval regardless of entity warmth.
+        """
+        if intent_value in ("emotional", "temporal"):
+            return False
+        if not entities:
+            return False
+        with self._state_lock:
+            active = self._state["active_entities"]
+            loaded = {m.get("_trigger_entity") for m in self._state["memories"]}
+            return all(e in active and e in loaded for e in entities)
 
     def _safe_log(self, role: str, content: str) -> None:
         """Log conversation turn with full error suppression."""

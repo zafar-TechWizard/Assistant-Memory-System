@@ -114,10 +114,26 @@ class MemoryManager:
         logger.info("Loading embedding model…")
         embed = EmbeddingUtils()
 
+        # Warmup: prime MiniLM model and Neo4j connection pool now so the
+        # first user message doesn't pay the 400-800ms cold-start penalty.
+        logger.info("Warming up embedding model and Neo4j connection pool…")
+        _warmup_loop = asyncio.get_running_loop()
+        await _warmup_loop.run_in_executor(None, embed.generate_embedding, "warmup")
+        await self.l2_client.execute_query("RETURN 1")
+        logger.info("Warmup complete")
+
+        logger.info("Loading cross-encoder reranker…")
+        from memory.long_term import reranker as _reranker_module
+        await _warmup_loop.run_in_executor(None, _reranker_module.load_reranker)
+        logger.info("Reranker ready")
+
         self.retriever = MemoryRetrievalEngine(
             neo4j_client=self.l2_client,
             embedding_utils=embed,
         )
+
+        logger.info("Ensuring full-text search index (BM25)…")
+        await self.retriever.ensure_fulltext_index()
 
         # 3. Memory Router (intent classifier + tiered dispatch) ──────────────
         logger.info("Initialising MemoryRouter…")
