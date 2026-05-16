@@ -15,9 +15,7 @@ from pathlib import Path
 from threading import Lock
 from typing import Any, Dict
 
-from utils.logger import UniversalLogger
-
-logger = UniversalLogger.get_logger("working_memory")
+from memory.observability import observer
 
 # Minimum structure guaranteed to exist in every loaded context
 _DEFAULTS: Dict[str, Any] = {
@@ -69,11 +67,6 @@ class WorkingContextManager:
             if key not in data:
                 data[key] = type(default_val)()
 
-        logger.debug(
-            f"[ctx_mgr] Loaded — "
-            f"{len(data.get('active_entities', {}))} active entities, "
-            f"{len(data.get('memories', []))} memories"
-        )
         return data
 
     def save(self, data: Dict[str, Any]) -> None:
@@ -96,12 +89,6 @@ class WorkingContextManager:
             # Atomic replace (safe on both POSIX and Windows)
             os.replace(tmp_path, self.file_path)
 
-        logger.debug(
-            f"[ctx_mgr] Saved — "
-            f"{len(data.get('active_entities', {}))} active entities, "
-            f"{len(data.get('memories', []))} memories"
-        )
-
     # ──────────────────────────────────────────────────────────────────────────
     # Private helpers
     # ──────────────────────────────────────────────────────────────────────────
@@ -109,7 +96,6 @@ class WorkingContextManager:
     def _ensure_file_exists(self) -> None:
         """Create the file with empty defaults if it doesn't exist yet."""
         if not self.file_path.exists():
-            logger.info(f"[ctx_mgr] Creating new context file: {self.file_path}")
             self.file_path.parent.mkdir(parents=True, exist_ok=True)
             # Use save() so we get atomic write from day one
             self.save(dict(_DEFAULTS))

@@ -1,10 +1,10 @@
-from typing import List, Dict, Any, Set, Optional, Union
+import importlib.util
+import re
+from collections import OrderedDict
 from dataclasses import dataclass, asdict, field
 from enum import Enum
-import logging
-import re
 from pathlib import Path
-from collections import OrderedDict
+from typing import List, Dict, Any, Set, Optional, Union
 
 try:
     import spacy
@@ -28,16 +28,11 @@ except ImportError:
 
 # coreferee: spaCy plugin for co-reference resolution. Optional dependency.
 # Install: pip install coreferee && python -m coreferee install en
-# Resolves "she", "him", "they", "that" to their antecedents across turns.
-try:
-    import coreferee  # noqa: F401  (imported for spaCy pipe registration)
-    COREFEREE_AVAILABLE = True
-except ImportError:
-    COREFEREE_AVAILABLE = False
+# We check installation via find_spec — spaCy auto-loads the plugin via entry
+# points when add_pipe("coreferee") is called, no direct import needed.
+COREFEREE_AVAILABLE = importlib.util.find_spec("coreferee") is not None
 
-from utils.logger import UniversalLogger
-
-logger = UniversalLogger.get_logger("entity_extraction")
+from memory.observability import observer
 
 class EntityType(Enum):
     """Types of entities that can be extracted"""
@@ -155,18 +150,18 @@ class EntityExtractor:
             try:
                 self.nlp = spacy.load(spacy_model)
                 self.spacy_available = True
-                logger.info(f"Loaded spaCy model: {spacy_model}")
+                observer.info("loaded spaCy", model=spacy_model)
             except Exception as e:
                 if strict_spacy:
                     raise RuntimeError(
                         f"spaCy model '{spacy_model}' not available. "
                         f"Install with: python -m spacy download {spacy_model}"
                     )
-                logger.warning(f"spaCy not available, using fallback extraction: {e}")
+                observer.warning("spaCy unavailable — using fallback", error=str(e))
         else:
             if strict_spacy:
                 raise RuntimeError("spaCy not installed. Install with: pip install spacy")
-            logger.warning("⚠ spaCy not installed, using fallback extraction")
+            observer.warning("spaCy not installed — using fallback")
 
         # ── Add coreferee to spaCy pipeline (pronoun resolution) ─────────────
         self.coref_available = False
@@ -175,28 +170,22 @@ class EntityExtractor:
                 if "coreferee" not in self.nlp.pipe_names:
                     self.nlp.add_pipe("coreferee")
                 self.coref_available = True
-                logger.info("Added coreferee to spaCy pipeline (pronoun resolution enabled)")
+                observer.info("coreferee pipeline enabled")
             except Exception as e:
-                logger.warning(f"coreferee unavailable: {e}")
+                observer.warning("coreferee unavailable", error=str(e))
         elif use_coreferee and not COREFEREE_AVAILABLE:
-            logger.info(
-                "coreferee not installed — pronoun resolution disabled. "
-                "Install: pip install coreferee && python -m coreferee install en"
-            )
+            observer.info("coreferee not installed — pronoun resolution disabled")
 
         # ── Load GLiNER (zero-shot NER with custom labels) ───────────────────
         self.gliner_model = None
         if use_gliner and GLINER_AVAILABLE:
             try:
                 self.gliner_model = GLiNER.from_pretrained(gliner_model)
-                logger.info(f"Loaded GLiNER model: {gliner_model}")
+                observer.info("loaded GLiNER", model=gliner_model)
             except Exception as e:
-                logger.warning(f"GLiNER load failed — falling back to spaCy NER: {e}")
+                observer.warning("GLiNER load failed — fallback to spaCy NER", error=str(e))
         elif use_gliner and not GLINER_AVAILABLE:
-            logger.info(
-                "GLiNER not installed — using spaCy NER only. "
-                "Install: pip install gliner"
-            )
+            observer.info("GLiNER not installed — using spaCy NER only")
 
         # Initialize matchers if spaCy available
         if self.spacy_available:
@@ -281,10 +270,6 @@ class EntityExtractor:
             if len(self._cache) > self._CACHE_MAX_SIZE:
                 self._cache.popitem(last=False)  # evict least-recently-used
         
-        logger.debug(
-            f"Extracted {len(entities)} entities from text: '{text[:50]}...'"
-        )
-        
         return result
     
     def extract_entities_detailed(self, text: str) -> Dict[str, List[Entity]]:
@@ -348,10 +333,6 @@ class EntityExtractor:
             if len(self._cache) > self._CACHE_MAX_SIZE:
                 self._cache.popitem(last=False)
 
-        logger.debug(
-            f"[ctx-extract] {len(entities)} entities from "
-            f"{len(recent_messages)} recent turns + current"
-        )
         return result
 
     def _extract_combined(self, combined_text: str, current_message: str) -> List[Entity]:
@@ -390,7 +371,7 @@ class EntityExtractor:
                         metadata={"source": "gliner", "gliner_label": label_raw},
                     ))
             except Exception as exc:
-                logger.warning(f"[gliner] inference failed: {exc}")
+                observer.warning("gliner inference failed", error=str(exc))
 
         # ── spaCy NER + custom matchers + noun chunks ─────────────────────────
         if self.spacy_available:
@@ -406,7 +387,7 @@ class EntityExtractor:
                     )
                     entities.extend(coref_entities)
             except Exception as exc:
-                logger.warning(f"[spacy] extraction failed: {exc}")
+                observer.warning("spacy extraction failed", error=str(exc))
         elif self.gliner_model is None:
             # Neither GLiNER nor spaCy — fallback heuristics
             entities.extend(self._extract_with_heuristics(combined_text))
@@ -427,8 +408,7 @@ class EntityExtractor:
         out: List[Entity] = []
         try:
             doc = self.nlp(combined_text)
-        except Exception as exc:
-            logger.debug(f"[coref] doc parse failed: {exc}")
+        except Exception:
             return out
 
         chains = getattr(doc._, "coref_chains", None)
@@ -488,10 +468,9 @@ class EntityExtractor:
                     confidence=0.78,
                     start_char=head_tokens[0].idx,
                     end_char=head_tokens[-1].idx + len(head_tokens[-1]),
-                    metadata={"source": "coreference", "chain_len": len(chain.mentions)},
+                    metadata={"source": "coreference", "chain_len": len(mentions)},
                 ))
-            except Exception as exc:
-                logger.debug(f"[coref] chain processing failed: {exc}")
+            except Exception:
                 continue
 
         return out
@@ -550,22 +529,19 @@ class EntityExtractor:
             ... )
         """
         if not self.spacy_available:
-            logger.warning("Cannot add patterns without spaCy")
+            observer.warning("cannot add patterns without spaCy")
             return
-        
+
         if pattern_type == "token":
             self.matcher.add(name, [pattern])
         else:  # phrase
             phrases = [self.nlp.make_doc(p) for p in pattern]
             self.phrase_matcher.add(name, phrases)
-        
-        logger.info(f"Added custom pattern: {name} ({pattern_type})")
-    
+
     def clear_cache(self):
         """Clear entity cache."""
         if self._cache is not None:
             self._cache.clear()
-            logger.info("Entity cache cleared")
     
 
     def _extract_with_spacy(self, text: str) -> List[Entity]:
@@ -908,10 +884,8 @@ class EntityExtractor:
                 else:  # phrase
                     phrases = [self.nlp.make_doc(p) for p in pattern]
                     self.phrase_matcher.add(name, phrases)
-                
-                logger.debug(f"Added custom pattern: {name}")
             except Exception as e:
-                logger.error(f"Error adding pattern '{name}': {e}")
+                observer.error("entity pattern add failed", exception=e, pattern=name)
 
 
 def create_entity_extractor(

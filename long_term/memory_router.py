@@ -52,14 +52,13 @@ import asyncio
 import math
 import re
 import time
-import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from enum import Enum
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-from utils.logger import UniversalLogger
 from memory.long_term import reranker as _reranker
+from memory.observability import observer
 
 # Optional: dateparser for named day-of-week parsing ("last Tuesday")
 try:
@@ -67,8 +66,6 @@ try:
     _HAS_DATEPARSER = True
 except ImportError:
     _HAS_DATEPARSER = False
-
-logger = UniversalLogger.get_logger("memory_router")
 
 
 # =============================================================================
@@ -465,7 +462,7 @@ class MemoryRouter:
         self._engine     = engine
         self._classifier = IntentClassifier()
         self._coverage   = CoverageChecker()
-        logger.info("MemoryRouter ready")
+        observer.info("MemoryRouter ready")
 
     # -------------------------------------------------------------------------
     # Public: classify only (no retrieval)
@@ -499,10 +496,6 @@ class MemoryRouter:
 
         # ── 1. Intent classification (~0ms) ───────────────────────────────────
         ir = self._classifier.classify(message, entities)
-        logger.info(
-            f"[router] intent={ir.primary_intent.value} ({ir.confidence:.2f}) "
-            f"co={[c.value for c in ir.co_intents]} signals={ir.signals_fired}"
-        )
 
         # ── AMBIENT fast-path: skip LTM entirely ──────────────────────────────
         if ir.primary_intent == Intent.AMBIENT and not ir.co_intents:
@@ -515,7 +508,6 @@ class MemoryRouter:
 
         # ── 2. Dynamic budget ─────────────────────────────────────────────────
         eff_budget = budget or self._budget(ir, entities)
-        logger.debug(f"[router] budget={eff_budget}")
 
         # ── 3. Phase A: Tier 1 + Tier 2 CONCURRENTLY ─────────────────────────
         tier1_res, tier2_res = await asyncio.gather(
@@ -524,10 +516,10 @@ class MemoryRouter:
             return_exceptions=True,
         )
         if isinstance(tier1_res, Exception):
-            logger.warning(f"[router] Tier 1 error: {tier1_res}")
+            observer.warning("router tier1 failed", error=str(tier1_res))
             tier1_res = []
         if isinstance(tier2_res, Exception):
-            logger.warning(f"[router] Tier 2 error: {tier2_res}")
+            observer.warning("router tier2 failed", error=str(tier2_res))
             tier2_res = []
 
         phase_a: List[Dict] = list(tier1_res) + list(tier2_res)
@@ -536,7 +528,6 @@ class MemoryRouter:
         report = self._coverage.check(phase_a, entities, ir.temporal_window)
         backup: List[Dict] = []
         if report.has_misses:
-            logger.info(f"[router] Coverage misses detected: {report.missed}")
             raw_backup = await self._backup(report, entities)
             backup = [dict(m, _coverage_source=True) for m in raw_backup]
 
@@ -548,7 +539,7 @@ class MemoryRouter:
                     topic=entities[0] if entities else None
                 )
             except Exception as exc:
-                logger.warning(f"[router] Emotional baseline failed: {exc}")
+                observer.warning("emotional baseline failed", error=str(exc))
 
         # ── 5. Phase C: Normalize → deduplicate → rank → package ─────────────
         all_results = phase_a + backup
@@ -565,10 +556,6 @@ class MemoryRouter:
             asyncio.create_task(self._update_access_stats(surfaced))
 
         ms = (time.perf_counter() - t0) * 1000
-        logger.info(
-            f"[router] {ms:.1f}ms | "
-            f"must_know={len(must_know)} context={len(context)} assoc={len(associations)}"
-        )
 
         return RoutedMemories(
             intent=ir.primary_intent,
@@ -790,7 +777,6 @@ class MemoryRouter:
         for r in raw:
             if not isinstance(r, Exception) and r:
                 out.extend(r)
-        logger.debug(f"[router] Backup fetched {len(out)} memories")
         return out
 
     # =========================================================================
@@ -953,7 +939,7 @@ class MemoryRouter:
                 rest_tail = ordered[50:]
                 ordered  = _reranker.rerank(message, top50, top_n=len(top50)) + rest_tail
             except Exception as exc:
-                logger.debug(f"[router] Reranker skipped: {exc}")
+                observer.warning("reranker skipped", error=str(exc))
 
         # Separate by tier hint / coverage source / recency (O(1) ID-set checks)
         def _mid(m: Dict) -> str:
@@ -1053,7 +1039,6 @@ class MemoryRouter:
             for j in range(i + 1, len(ids))
         ]
         await asyncio.gather(*tasks, return_exceptions=True)
-        logger.debug(f"[router] Reinforced {len(tasks)} connections")
 
     async def _update_access_stats(self, memories: List[Dict]) -> None:
         """
@@ -1084,6 +1069,5 @@ class MemoryRouter:
                 query,
                 parameters={"ids": ids, "now": datetime.now().isoformat()},
             )
-            logger.debug(f"[router] Updated access stats for {len(ids)} memories")
         except Exception as exc:
-            logger.warning(f"[router] access_count update failed (non-fatal): {exc}")
+            observer.warning("access_count update failed", error=str(exc))

@@ -16,16 +16,13 @@ Features:
 """
 
 import math
-import logging
 from typing import List, Dict, Any, Optional
 from datetime import datetime
 from enum import Enum
 
 from memory.long_term.infrastructure.neo4j_client import Neo4jClient
 from memory.processing.embedding_utils import EmbeddingUtils
-
-
-logger = logging.getLogger(__name__)
+from memory.observability import observer
 
 # Filter appended to every retrieval WHERE clause.
 # Nodes marked superseded=true during consolidation (CONTRADICT operation) must
@@ -148,7 +145,7 @@ class MemoryRetrievalEngine:
         """
         self.client = neo4j_client
         self.embed_util = embedding_utils or EmbeddingUtils()
-        logger.info("MemoryRetrievalEngine initialized successfully")
+        observer.info("MemoryRetrievalEngine initialized")
     
     # ========================================================================
     # BASIC RETRIEVAL METHODS
@@ -209,7 +206,6 @@ class MemoryRetrievalEngine:
             parameters={'topic': topic, 'limit': limit}
         )
         
-        logger.info(f"Retrieved {len(results)} memories for topic '{topic}'")
         return results
     
     async def get_memories_by_multiple_topics(
@@ -265,7 +261,6 @@ class MemoryRetrievalEngine:
         """
         
         results = await self.client.execute_query(query, parameters)
-        logger.info(f"Retrieved {len(results)} memories for {len(topics)} topics")
         return results
     
     async def bm25_search(
@@ -312,7 +307,6 @@ class MemoryRetrievalEngine:
             query,
             parameters={"query_string": query_string, "limit": limit},
         )
-        logger.info(f"BM25 '{query_string}' → {len(results)} results")
         return results
 
     # ========================================================================
@@ -381,10 +375,6 @@ class MemoryRetrievalEngine:
             parameters={'topic': topic, 'max_hops': max_hops, 'limit': limit}
         )
         
-        logger.info(
-            f"Retrieved {len(results)} memories with connected nodes "
-            f"for topic '{topic}'"
-        )
         return results
     
     async def get_connected_nodes_only(
@@ -433,9 +423,6 @@ class MemoryRetrievalEngine:
             parameters={'memory_id': memory_id, 'max_hops': max_hops, 'limit': limit}
         )
         
-        logger.info(
-            f"Retrieved {len(results)} connected nodes for memory '{memory_id}'"
-        )
         return results
     
     async def get_memory_cluster(
@@ -496,10 +483,6 @@ class MemoryRetrievalEngine:
             'members': results
         }
         
-        logger.info(
-            f"Found cluster of {len(results)} memories "
-            f"around '{starting_memory_id}'"
-        )
         return cluster
 
     async def _spreading_activation(
@@ -597,10 +580,6 @@ class MemoryRetrievalEngine:
         scored.sort(key=lambda x: x[0], reverse=True)
         top = [m for _, m in scored[:budget]]
 
-        logger.info(
-            f"Spreading activation ({intent}): {len(entities)} entities → "
-            f"{len(rows)} candidates → {len(top)} returned"
-        )
         return top
 
     # ========================================================================
@@ -700,9 +679,6 @@ class MemoryRetrievalEngine:
             parameters = {'top_k': top_k, 'query_vector': query_vector}
 
         results = await self.client.execute_query(query, parameters)
-        logger.info(
-            f"Semantic search for '{query_text}' returned {len(results)} results"
-        )
         return results
 
 
@@ -802,8 +778,6 @@ class MemoryRetrievalEngine:
                 grouped[row['topic']]['connected_memories'] = row.get(
                     'connected_memories', []
                 )
-        
-        logger.info(f"Retrieved memories grouped by {len(topics)} topics")
         return grouped
     
     # ========================================================================
@@ -861,7 +835,6 @@ class MemoryRetrievalEngine:
         """
         
         results = await self.client.execute_query(query, parameters)
-        logger.info(f"Retrieved {len(results)} recent memories")
         return results
     
     async def get_memories_by_time_range(
@@ -914,7 +887,6 @@ class MemoryRetrievalEngine:
         """
         
         results = await self.client.execute_query(query, parameters)
-        logger.info(f"Retrieved {len(results)} memories in time range")
         return results
     
     # ========================================================================
@@ -963,7 +935,6 @@ class MemoryRetrievalEngine:
         """
         
         results = await self.client.execute_query(query, parameters)
-        logger.info(f"Retrieved {len(results)} most connected memories")
         return results
     
     async def get_emotionally_significant_memories(
@@ -1013,7 +984,6 @@ class MemoryRetrievalEngine:
         """
         
         results = await self.client.execute_query(query, parameters)
-        logger.info(f"Retrieved {len(results)} emotionally significant memories")
         return results
 
     async def get_recent_emotional_memories(
@@ -1060,7 +1030,6 @@ class MemoryRetrievalEngine:
         LIMIT $limit
         """
         results = await self.client.execute_query(query, parameters)
-        logger.info(f"Retrieved {len(results)} recent emotional memories (last {days}d)")
         return results
 
     async def get_memories_by_emotion(
@@ -1125,7 +1094,6 @@ class MemoryRetrievalEngine:
         """
         
         results = await self.client.execute_query(query, parameters)
-        logger.info(f"Retrieved {len(results)} memories with emotion '{emotion}'")
         return results
     
     async def get_emotions_summary(
@@ -1184,8 +1152,6 @@ class MemoryRetrievalEngine:
         
         summary = results[0] if results else {}
         summary['most_emotional_memory'] = most_emotional[0] if most_emotional else None
-        
-        logger.info("Retrieved emotions summary")
         return summary
     
     # ========================================================================
@@ -1254,10 +1220,6 @@ class MemoryRetrievalEngine:
             }
         )
         
-        logger.info(
-            f"Retrieved {len(results)} strongly connected memories "
-            f"(min_strength={min_strength})"
-        )
         return results
     
     async def get_memories_with_weighted_relevance(
@@ -1323,10 +1285,6 @@ class MemoryRetrievalEngine:
             parameters={'topic': topic, 'limit': limit}
         )
         
-        logger.info(
-            f"Retrieved {len(results)} memories with weighted relevance "
-            f"for '{topic}'"
-        )
         return results
     
     async def reinforce_memory_connection(
@@ -1384,12 +1342,6 @@ class MemoryRetrievalEngine:
             }
         )
         
-        if results:
-            logger.info(
-                f"Reinforced connection: {from_memory_id} → {to_memory_id} "
-                f"(new strength: {results[0]['new_strength']:.2f})"
-            )
-        
         return results[0] if results else {}
     
     # ========================================================================
@@ -1409,9 +1361,8 @@ class MemoryRetrievalEngine:
         """
         try:
             await self.client.execute_query(query)
-            logger.info("Full-text index 'memory_fts' ready")
         except Exception as exc:
-            logger.warning(f"Full-text index creation returned: {exc}")
+            observer.warning("full-text index creation returned", detail=str(exc))
 
     async def get_memory_statistics(self) -> Dict[str, Any]:
         """
@@ -1545,8 +1496,6 @@ class MemoryRetrievalEngine:
             """
             rows = await self.client.execute_query(query, parameters={"entity": entity})
             seed_ids.extend(r["id"] for r in rows if r.get("id"))
-
-        logger.debug(f"Seed resolution: {entities} → {len(seed_ids)} node(s)")
         return seed_ids
 
     @staticmethod

@@ -21,10 +21,7 @@ except ImportError:
     from pydantic import BaseModel, Field, validator, root_validator  # type: ignore
 # ─────────────────────────────────────────────────────────────────────────────
 
-import logging  # Import logger for validation warnings
-
-
-logger = logging.getLogger(__name__)
+from memory.observability import observer
 
 
 class MemoryContext(str, Enum):
@@ -126,7 +123,7 @@ class ExperienceMemoryNode(BaseMemoryNode):
             'travel', 'celebration', 'problem_solving', 'collaboration', 'other'
         ]
         if v.lower() not in common_types:
-            logger.warning(f"Uncommon event type: {v}")
+            observer.warning("uncommon event type", value=v)
         return v
 
 
@@ -171,7 +168,7 @@ class KnowledgeMemoryNode(BaseMemoryNode):
             'health', 'finance', 'education', 'work', 'social', 'other'
         ]
         if v.lower() not in common_categories:
-            logger.warning(f"Uncommon knowledge category: {v}")
+            observer.warning("uncommon knowledge category", value=v)
         return v
 
 
@@ -221,7 +218,7 @@ class RelationshipMemoryNode(BaseMemoryNode):
             'mentor', 'student', 'neighbor', 'classmate', 'teammate', 'other'
         ]
         if v.lower() not in common_types:
-            logger.warning(f"Unknown relationship type: {v}")
+            observer.warning("uncommon relationship type", value=v)
         return v
 
 

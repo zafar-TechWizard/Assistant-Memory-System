@@ -40,9 +40,7 @@ from memory.working_memory.working_context import (
     NotifyPriority,
     WorkspaceItemType,
 )
-from utils.logger import UniversalLogger
-
-logger = UniversalLogger.get_logger("workspace_watcher")
+from memory.observability import observer
 
 
 class WorkspaceWatcher:
@@ -94,7 +92,7 @@ class WorkspaceWatcher:
     def start(self) -> None:
         """Start the background watcher daemon thread."""
         if self._running:
-            logger.warning("[watcher] Already running — ignoring start()")
+            observer.warning("watcher already running")
             return
 
         self._running = True
@@ -104,15 +102,16 @@ class WorkspaceWatcher:
             daemon=True,
         )
         self._thread.start()
-        logger.info(
-            f"[watcher] Started "
-            f"(poll={self._poll_interval_s}s gap={self._gap_threshold_s}s)"
+        observer.info(
+            "WorkspaceWatcher started",
+            poll_s=self._poll_interval_s,
+            gap_s=self._gap_threshold_s,
         )
 
     def stop(self) -> None:
         """Signal the watcher thread to stop. Does not block."""
         self._running = False
-        logger.info("[watcher] Stop signal sent")
+        observer.info("WorkspaceWatcher stop signal sent")
 
     def record_user_activity(self) -> None:
         """
@@ -128,18 +127,15 @@ class WorkspaceWatcher:
     # ─────────────────────────────────────────────────────────────────────────
 
     def _watch_loop(self) -> None:
-        logger.debug("[watcher] Loop started")
         while self._running:
             try:
                 self._check_pending_notifications()
                 self._check_due_reminders()
             except Exception as exc:
-                # Never let the watcher crash — log and continue
-                logger.error(f"[watcher] Unexpected error: {exc}", exc_info=True)
+                # Never let the watcher crash — record and continue
+                observer.error("watcher loop iteration failed", exception=exc)
 
             time.sleep(self._poll_interval_s)
-
-        logger.debug("[watcher] Loop exited")
 
     # ─────────────────────────────────────────────────────────────────────────
     # Checks
@@ -163,7 +159,6 @@ class WorkspaceWatcher:
                 WorkspaceItemStatus.HANDLED,
                 WorkspaceItemStatus.COMPLETED,
             ):
-                logger.info(f"[watcher] Due reminder: '{item.title}'")
                 self._fire(item)
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -197,10 +192,6 @@ class WorkspaceWatcher:
         Mark the item as HANDLED and invoke the proactive callback.
         The callback is responsible for activating SOFi.
         """
-        logger.info(
-            f"[watcher] Firing notification: '{item.title}' "
-            f"(type={item.type.value} priority={item.notify_priority.value})"
-        )
         # Mark HANDLED first so a second poll cycle doesn't double-fire
         self._ctx.workspace.update_item(
             item.id,
@@ -211,7 +202,8 @@ class WorkspaceWatcher:
         try:
             self._callback(item)
         except Exception as exc:
-            logger.error(
-                f"[watcher] proactive_callback raised for '{item.title}': {exc}",
-                exc_info=True,
+            observer.error(
+                "proactive_callback raised",
+                exception=exc,
+                title=item.title,
             )

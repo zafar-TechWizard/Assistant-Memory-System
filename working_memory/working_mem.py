@@ -44,7 +44,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 
-from utils.logger import UniversalLogger
 from memory.config import config
 # Renamed to avoid collision with the new centralized WorkingContextManager
 from memory.working_memory.context_manager import WorkingContextManager as DiskContextManager
@@ -55,8 +54,7 @@ from memory.working_memory.working_context import (
 from memory.processing.conversationLogger import ConversationLogger
 from memory.processing.entity_extractor import EntityExtractor
 from memory.long_term.memory_router import RoutedMemories
-
-logger = UniversalLogger.get_logger("working_memory")
+from memory.observability import observer, summarize_working_context
 
 
 # ---------------------------------------------------------------------------
@@ -158,10 +156,11 @@ class WorkingMemory:
             thread_name_prefix="SOFiWM",
         )
 
-        logger.info(
-            f"WorkingMemory ready | user={user_id} | "
-            f"entity_expiry={config.entity_expiry_minutes}min | "
-            f"context_timeout={config.context_retrieval_timeout_ms}ms"
+        observer.info(
+            "WorkingMemory ready",
+            user=user_id,
+            entity_expiry_min=config.entity_expiry_minutes,
+            context_timeout_ms=config.context_retrieval_timeout_ms,
         )
 
     # =========================================================================
@@ -190,18 +189,24 @@ class WorkingMemory:
         self._processing_done.clear()
         t0 = time.perf_counter()
 
-        try:
-            logger.info(f"[reactive] {role} message ({len(content)} chars)")
+        # Snapshot state for review (if enabled) — cheap when disabled
+        wc_before: Dict[str, Any] = {}
+        if observer.review_enabled:
+            with self._state_lock:
+                wc_before = summarize_working_context(self._state)
+            observer.start_trace(role, content, wc_before)
 
+        try:
             # ── 1. Entity extraction (two passes) ─────────────────────────────
+            t_ext = time.perf_counter()
+
             # 1a) Current-only entities — drive active_entities tracking/expiry
             current_only: Set[str] = set(
                 self.entity_extractor.extract_entities(content)
             )
 
             # 1b) Sliding-window entities — combine last 3 turns + current for
-            #     pronoun resolution and topic anchoring. "she" in the current
-            #     message resolves to "Sarah" if Sarah appeared 2 turns ago.
+            #     pronoun resolution and topic anchoring.
             try:
                 recent_raw = self.conversation_logger.get_conversation_history(max_turns=3)
                 recent_texts = [t.get("content", "") for t in (recent_raw or [])][-3:]
@@ -220,53 +225,78 @@ class WorkingMemory:
 
             # ── 2. Active entity propagation ──────────────────────────────────
             # If current message has NO entities (e.g. "I'm stressed"), inherit
-            # currently warm entities so retrieval still has an anchor.
+            # the 3 most-recently-active entities so retrieval still has an anchor.
             with self._state_lock:
-                active_keys = set(self._state["active_entities"].keys())
+                # Sort by expiry desc — most recently refreshed first
+                _active_sorted = sorted(
+                    self._state["active_entities"].items(),
+                    key=lambda kv: kv[1],
+                    reverse=True,
+                )
+                active_keys = {e for e, _ in _active_sorted[:3]}
 
             if not current_only and not context_entities and active_keys:
-                logger.debug(
-                    f"[reactive] No entities extracted — inheriting active: {active_keys}"
-                )
                 retrieval_entities = active_keys
+                anchor_source = "active_propagation"
             else:
-                # Prefer sliding-window entities for richer retrieval anchoring;
-                # falls back to current-only if window is empty.
                 retrieval_entities = context_entities or current_only
+                anchor_source = "sliding_window" if context_entities else "current_only"
 
             # ── 3. Update active_entities with CURRENT message entities only ──
-            # Only entities truly in the current message refresh expiry —
-            # sliding-window entities are anchors, not "currently active".
             with self._state_lock:
                 self._state["current_entities"] = list(current_only)
                 new_entities = self._update_active_entities(current_only)
 
             entities = retrieval_entities   # alias used downstream
-            logger.debug(
-                f"[reactive] current={current_only} context={context_entities} "
-                f"retrieval={retrieval_entities} new={new_entities}"
-            )
 
-            # ── 3. LTM retrieval — router or fallback ─────────────────────────
-            # Classify intent first (~0ms). Trigger LTM on any non-AMBIENT intent,
-            # not only when new entities appear — EMOTIONAL/TEMPORAL queries like
-            # "I'm stressed" have no new entities but still need long-term retrieval.
+            observer.stage("entity_extraction", {
+                "current_only":       sorted(current_only),
+                "context_entities":   sorted(context_entities),
+                "retrieval_entities": sorted(retrieval_entities),
+                "new_entities":       sorted(new_entities),
+                "anchor_source":      anchor_source,
+                "recent_turns_used":  len(recent_texts),
+            }, ms=(time.perf_counter() - t_ext) * 1000)
+
+            # ── 4. Intent classification ──────────────────────────────────────
+            t_intent = time.perf_counter()
             _ir = self._router.classify(content, list(entities)) if self._router else None
             _non_ambient = _ir is not None and _ir.primary_intent.value != "ambient"
 
+            if _ir is not None:
+                observer.stage("intent_classification", {
+                    "primary_intent":  _ir.primary_intent.value,
+                    "confidence":      _ir.confidence,
+                    "signals_fired":   _ir.signals_fired,
+                    "temporal_window": str(_ir.temporal_window) if _ir.temporal_window else None,
+                }, ms=(time.perf_counter() - t_intent) * 1000)
+
+            # ── 5. LTM retrieval — router or fallback ─────────────────────────
             if _non_ambient and self._loop:
                 entities_list = list(entities)
                 _intent_val = _ir.primary_intent.value
 
                 # RF-Mem familiarity gate: if every entity is already warm AND
                 # has loaded memories, skip LTM entirely (0ms, no DB call).
-                if entities_list and self._is_familiarity_hit(entities_list, _intent_val):
-                    logger.info(
-                        f"[reactive] Familiarity hit — reusing loaded memories "
-                        f"{entities_list}"
-                    )
+                fam_hit = bool(entities_list) and self._is_familiarity_hit(
+                    entities_list, _intent_val
+                )
+                observer.stage("familiarity_gate", {
+                    "hit":      fam_hit,
+                    "entities": entities_list,
+                    "reason":   "warm+loaded" if fam_hit else (
+                        "always_miss_for_emotional_temporal"
+                        if _intent_val in ("emotional", "temporal")
+                        else "cold_or_unloaded"
+                    ),
+                })
+
+                if fam_hit:
+                    pass   # reuse loaded memories from previous turn
                 else:
+                    t_route = time.perf_counter()
                     routed = self._fetch_via_router(content, entities)
+                    route_ms = (time.perf_counter() - t_route) * 1000
                     if routed is not None:
                         flat_new = routed.must_know + routed.context + routed.associations
                         # Tag memories so familiarity gate works on the next turn
@@ -325,17 +355,21 @@ class WorkingMemory:
                                 current_focus=", ".join(focus_entities[:3]),
                             )
 
-                        logger.info(
-                            f"[reactive] Router: {routed.intent.value} "
-                            f"must_know={len(routed.must_know)} "
-                            f"context={len(routed.context)} "
-                            f"assoc={len(routed.associations)} "
-                            f"in {routed.latency_ms:.1f}ms"
-                        )
+                        observer.stage("router_result", {
+                            "intent":          routed.intent.value,
+                            "must_know_count": len(routed.must_know),
+                            "context_count":   len(routed.context),
+                            "assoc_count":     len(routed.associations),
+                            "router_latency_ms": routed.latency_ms,
+                            "must_know_ids":   [str(m.get("id", ""))[:12] for m in routed.must_know],
+                        }, ms=route_ms)
                     elif new_entities:
                         # Router returned None (timeout/error) — fallback to direct retrieval
                         fetched = self._fetch_from_longterm(new_entities)
-                        logger.info(f"[reactive] Fallback: {len(fetched)} memories retrieved")
+                        observer.stage("router_fallback", {
+                            "reason": "router_none",
+                            "memories_fetched": len(fetched),
+                        })
                         with self._state_lock:
                             self._state["memories"] = self._merge_memories(
                                 self._state["memories"], fetched
@@ -344,21 +378,40 @@ class WorkingMemory:
             elif new_entities and self._loop:
                 # No router configured — direct retrieval for new entities only
                 fetched = self._fetch_from_longterm(new_entities)
-                logger.info(f"[reactive] Direct retrieval: {len(fetched)} memories")
+                observer.stage("direct_retrieval", {
+                    "memories_fetched": len(fetched),
+                })
                 with self._state_lock:
                     self._state["memories"] = self._merge_memories(
                         self._state["memories"], fetched
                     )
 
-            # ── 4. Non-critical, fire-and-forget ─────────────────────────────
+            # ── Fire-and-forget: log conversation + persist state ────────────
             self._executor.submit(self._safe_log, role, content)
             self._executor.submit(self._persist_state)
 
             elapsed = (time.perf_counter() - t0) * 1000
-            logger.info(f"[reactive] Done in {elapsed:.1f} ms")
+
+            # End review trace with full outcome
+            if observer.review_enabled:
+                with self._state_lock:
+                    wc_after = summarize_working_context(self._state)
+                observer.end_trace(
+                    outcome={"total_ms": round(elapsed, 3)},
+                    working_context_after=wc_after,
+                )
 
         except Exception as exc:
-            logger.error(f"[reactive] Unexpected error: {exc}", exc_info=True)
+            observer.error("reactive_processing failed", exception=exc, role=role)
+            if observer.review_enabled:
+                observer.stage("error", {
+                    "type": type(exc).__name__,
+                    "message": str(exc),
+                })
+                observer.end_trace(
+                    outcome={"failed": True, "error": str(exc)},
+                    working_context_after={},
+                )
 
         finally:
             # Always signal completion so get_working_context() unblocks
@@ -383,9 +436,9 @@ class WorkingMemory:
         """
         completed = self._processing_done.wait(timeout=self._timeout_s)
         if not completed:
-            logger.warning(
-                f"[context] Background processing timed out after "
-                f"{self._timeout_s * 1000:.0f} ms — returning partial context"
+            observer.warning(
+                "get_working_context timeout — returning partial",
+                timeout_ms=int(self._timeout_s * 1000),
             )
 
         with self._state_lock:
@@ -410,14 +463,13 @@ class WorkingMemory:
         Flush state to disk and shut down the thread pool.
         Call from memory_manager.shutdown() (sync context is fine).
         """
-        logger.info("[shutdown] Flushing working memory to disk…")
         try:
             self._persist_state()
         except Exception as e:
-            logger.warning(f"[shutdown] Persist failed: {e}")
+            observer.warning("shutdown persist failed", error=str(e))
 
         self._executor.shutdown(wait=True, cancel_futures=False)
-        logger.info("[shutdown] WorkingMemory stopped.")
+        observer.info("WorkingMemory shutdown complete")
 
     # =========================================================================
     # ENTITY MANAGEMENT
@@ -440,11 +492,9 @@ class WorkingMemory:
         for entity in entities:
             if entity in self._state["active_entities"]:
                 self._state["active_entities"][entity] = new_expiry
-                logger.debug(f"[entities] Refreshed '{entity}'")
             else:
                 self._state["active_entities"][entity] = new_expiry
                 new_entities.add(entity)
-                logger.debug(f"[entities] New → '{entity}'")
 
         return new_entities
 
@@ -463,20 +513,15 @@ class WorkingMemory:
 
         for entity in expired:
             del self._state["active_entities"][entity]
-            logger.info(f"[entities] Expired: '{entity}'")
 
         # Drop memories whose trigger entity is no longer active
         active_set = set(self._state["active_entities"].keys())
-        before = len(self._state["memories"])
         self._state["memories"] = [
             m for m in self._state["memories"]
             # Keep if no trigger entity tagged, or if trigger is still active
             if not m.get("_trigger_entity")
             or m["_trigger_entity"] in active_set
         ]
-        pruned = before - len(self._state["memories"])
-        if pruned:
-            logger.debug(f"[entities] Pruned {pruned} stale memories")
 
     # =========================================================================
     # LONG-TERM MEMORY RETRIEVAL — Router Bridge + Legacy Fallback
@@ -507,12 +552,13 @@ class WorkingMemory:
             )
             return future.result(timeout=self._timeout_s * 0.80)
         except TimeoutError:
-            logger.warning(
-                f"[wm] Router timed out after {self._timeout_s * 0.80:.2f}s"
+            observer.warning(
+                "router timeout",
+                timeout_s=round(self._timeout_s * 0.80, 2),
             )
             return None
         except Exception as exc:
-            logger.warning(f"[wm] Router failed — falling back to direct retrieval: {exc}")
+            observer.error("router call failed", exception=exc)
             return None
 
     def _fetch_from_longterm(self, entities: Set[str]) -> List[Dict[str, Any]]:
@@ -567,15 +613,15 @@ class WorkingMemory:
                     m["_trigger_entity"] = entity
 
                 all_memories.extend(memories)
-                logger.debug(f"[ltm] '{entity}' → {len(memories)} memories")
 
             except TimeoutError:
-                logger.warning(
-                    f"[ltm] Timed out retrieving '{entity}' "
-                    f"({per_entity_timeout * 1000:.0f} ms limit)"
+                observer.warning(
+                    "ltm fetch timeout",
+                    entity=entity,
+                    timeout_ms=int(per_entity_timeout * 1000),
                 )
             except Exception as exc:
-                logger.warning(f"[ltm] Failed for '{entity}': {exc}")
+                observer.error("ltm fetch failed", exception=exc, entity=entity)
 
         return all_memories
 
@@ -610,7 +656,6 @@ class WorkingMemory:
         # Hard cap
         if len(merged) > self._max_total:
             merged = merged[-self._max_total:]
-            logger.debug(f"[memories] Capped at {self._max_total}")
 
         return merged
 
@@ -642,14 +687,15 @@ class WorkingMemory:
                 )
                 self._state["memories"] = persisted.get("memories", [])
 
-            logger.info(
-                f"[recovery] Restored {len(active)} active entities and "
-                f"{len(self._state['memories'])} memories from disk"
+            observer.info(
+                "state restored from disk",
+                active_entities=len(active),
+                memories=len(self._state["memories"]),
             )
         except FileNotFoundError:
-            logger.info("[recovery] No persisted state found — starting fresh")
+            pass   # fresh start
         except Exception as exc:
-            logger.warning(f"[recovery] Could not restore state: {exc} — fresh start")
+            observer.warning("state restore failed", error=str(exc))
 
     def _persist_state(self) -> None:
         """Snapshot current state to disk (runs in executor thread)."""
@@ -663,7 +709,7 @@ class WorkingMemory:
                 }
             self._disk_ctx.save(snapshot)
         except Exception as exc:
-            logger.warning(f"[persist] Disk write failed: {exc}")
+            observer.warning("disk persist failed", error=str(exc))
 
     # =========================================================================
     # HELPERS
@@ -692,7 +738,7 @@ class WorkingMemory:
         try:
             self.conversation_logger.log_message(role, content)
         except Exception as exc:
-            logger.warning(f"[log] Conversation logging failed: {exc}")
+            observer.warning("conversation log write failed", error=str(exc))
 
     def __del__(self) -> None:
         """Best-effort cleanup on GC — do not rely on this for correctness."""

@@ -1,11 +1,10 @@
 
 import subprocess
 import time
-import logging
-from typing import Dict, Any, Optional
 from pathlib import Path
+from typing import Dict, Any, Optional
 
-logger = logging.getLogger(__name__)
+from memory.observability import observer
 
 # SOFI Neo4j Configuration
 SOFI_NEO4J_CONFIG = {
@@ -45,27 +44,26 @@ class DockerManager:
         
     def _run_command(self, command: list[str], check: bool = True) -> subprocess.CompletedProcess:
         """Run a shell command and return the result"""
-        logger.debug(f"Running command: {' '.join(command)}")
         result = subprocess.run(
             command,
             capture_output=True,
             text=True,
             check=False
         )
-        
+
         if check and result.returncode != 0:
-            logger.error(f"Command failed: {result.stderr}")
+            observer.error("docker command failed", stderr=result.stderr, cmd=" ".join(command))
             raise RuntimeError(f"Command failed: {result.stderr}")
-        
+
         return result
-    
+
     def is_docker_running(self) -> bool:
         """Check if Docker daemon is running"""
         try:
             result = self._run_command(["docker", "info"], check=False)
             return result.returncode == 0
         except Exception as e:
-            logger.error(f"Failed to check Docker status: {e}")
+            observer.error("docker status check failed", exception=e)
             return False
     
     def container_exists(self) -> bool:
@@ -96,29 +94,26 @@ class DockerManager:
         Raises:
             RuntimeError: If Docker is not running or container fails to start
         """
-        logger.info("Starting SOFI Neo4j Docker container...")
-        
+        observer.info("starting SOFI Neo4j container", name=self.container_name)
+
         # Check if Docker is running
         if not self.is_docker_running():
             raise RuntimeError("Docker is not running. Please start Docker Desktop.")
-        
+
         # Check if container is already running
         if self.is_container_running():
-            logger.info(f"Container '{self.container_name}' is already running")
+            observer.info("container already running", name=self.container_name)
             return
-        
+
         # Create data directory if it doesn't exist
         self.data_path.mkdir(parents=True, exist_ok=True)
-        logger.info(f"Using data directory: {self.data_path}")
-        
+
         # If container exists but is stopped, start it
         if self.container_exists():
-            logger.info(f"Starting existing container '{self.container_name}'...")
             self._run_command(["docker", "start", self.container_name])
-            logger.info(f"Container '{self.container_name}' started")
+            observer.info("existing container started", name=self.container_name)
         else:
             # Create and start new container
-            logger.info(f"Creating new container '{self.container_name}'...")
             docker_command = [
                 "docker", "run",
                 "-d",  # Detached mode
@@ -130,9 +125,9 @@ class DockerManager:
                 "-e", "NEO4J_ACCEPT_LICENSE_AGREEMENT=yes",
                 "neo4j:latest"
             ]
-            
+
             self._run_command(docker_command)
-            logger.info(f"Container '{self.container_name}' created and started")
+            observer.info("new container created", name=self.container_name)
     
     async def ensure_connection_async(self) -> None:
         """
@@ -152,11 +147,6 @@ class DockerManager:
         interval     = self.config["health_check_interval"]
         http_port    = self.config.get("http_port", 7474)
 
-        logger.info(
-            f"[async] Waiting for Neo4j to be ready "
-            f"(max {max_attempts * interval}s)..."
-        )
-
         for attempt in range(1, max_attempts + 1):
             await _asyncio.sleep(interval)
 
@@ -169,22 +159,13 @@ class DockerManager:
                 # Use a short timeout for the request
                 response = urllib.request.urlopen(f"http://localhost:{http_port}/", timeout=2)
                 if response.getcode() == 200:
-                    logger.info(f"[async] Neo4j ready (attempt {attempt}/{max_attempts})")
-                    logger.info(
-                        f"[async] Waiting {self.config['post_start_wait']}s "
-                        f"for full initialisation..."
-                    )
                     await _asyncio.sleep(self.config["post_start_wait"])
-                    logger.info("[async] Neo4j fully ready.")
+                    observer.info("Neo4j ready", attempt=attempt)
                     return
             except (URLError, Exception):
                 pass
 
-            logger.debug(f"[async] Still waiting... ({attempt}/{max_attempts})")
-
-        logger.warning(
-            "[async] Max wait time reached — Neo4j may not be fully ready."
-        )
+        observer.warning("Neo4j health check max wait reached")
 
     def ensure_connection(self) -> None:
         """
@@ -199,74 +180,56 @@ class DockerManager:
         import urllib.request
         from urllib.error import URLError
 
-        logger.info("Ensuring Neo4j is ready to accept connections...")
-        
         if not self.is_container_running():
             raise RuntimeError(f"Container '{self.container_name}' is not running")
-        
-        # Health check loop
+
         max_attempts = self.config["health_check_max_attempts"]
         interval = self.config["health_check_interval"]
         http_port = self.config.get("http_port", 7474)
-        
-        logger.info(f"Waiting for Neo4j to be ready (max {max_attempts * interval} seconds)...")
-        
+
         for attempt in range(1, max_attempts + 1):
             time.sleep(interval)
-            
+
             # Check if container is still running
             if not self.is_container_running():
                 raise RuntimeError(f"Container '{self.container_name}' stopped unexpectedly")
-            
+
             try:
                 # Use a short timeout for the request
                 response = urllib.request.urlopen(f"http://localhost:{http_port}/", timeout=2)
                 if response.getcode() == 200:
-                    logger.info(f"Neo4j is ready! (took ~{attempt * interval} seconds)")
-                    # Wait additional time for Neo4j to fully accept connections
-                    logger.info(f"Waiting additional {self.config['post_start_wait']} seconds for full initialization...")
                     time.sleep(self.config['post_start_wait'])
-                    logger.info("Neo4j is fully ready to accept connections")
+                    observer.info("Neo4j ready", attempt=attempt)
                     return
             except (URLError, Exception):
                 pass
-            
-            logger.debug(f"  Waiting... (attempt {attempt}/{max_attempts})")
-        
-        logger.warning("Max wait time reached, Neo4j may not be fully ready")
+
+        observer.warning("Neo4j health check max wait reached")
     
     def stop_docker(self) -> None:
         """
         Stop the SOFI Neo4j Docker container.
-        
+
         This method is idempotent - it will do nothing if the container
         is already stopped.
         """
-        logger.info("Stopping SOFI Neo4j Docker container...")
-        
         if self.is_container_running():
             self._run_command(["docker", "stop", self.container_name])
-            logger.info(f"Container '{self.container_name}' stopped")
-        else:
-            logger.info(f"Container '{self.container_name}' is not running")
-    
+            observer.info("container stopped", name=self.container_name)
+
     def remove_container(self) -> None:
         """
         Remove the SOFI Neo4j Docker container.
-        
+
         Note: This does NOT delete the data - data persists in the volume.
         """
-        logger.info("Removing SOFI Neo4j Docker container...")
-        
         if self.container_exists():
             # Stop first if running
             if self.is_container_running():
                 self.stop_docker()
-            
+
             self._run_command(["docker", "rm", self.container_name])
-            logger.info(f"Container '{self.container_name}' removed")
-        else:
-            logger.info(f"Container '{self.container_name}' does not exist")
+            observer.info("container removed", name=self.container_name)
     
     def get_status(self) -> Dict[str, Any]:
         """
@@ -333,54 +296,35 @@ def create_docker_manager(config: Optional[Dict[str, Any]] = None) -> DockerMana
     return DockerManager(config)
 
 
-# CLI for manual testing
+# CLI for manual testing — writes diagnostic events to memory/data/logs/
 if __name__ == "__main__":
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-    )
-    
+    observer.configure(log=True)
+
     manager = DockerManager()
-    
-    print("\n" + "="*80)
-    print("SOFI Neo4j Docker Manager")
-    print("="*80)
-    
     try:
-        # Get status
-        print("\n1. Checking current status...")
         status = manager.get_status()
-        print(f"   Docker running: {status['docker_running']}")
-        print(f"   Container exists: {status['container_exists']}")
-        print(f"   Container running: {status['container_running']}")
-        print(f"   Data path: {status['data_path']}")
-        
-        # Start Docker
-        print("\n2. Starting Docker container...")
+        observer.info(
+            "docker status",
+            docker_running=status["docker_running"],
+            container_exists=status["container_exists"],
+            container_running=status["container_running"],
+            data_path=str(status["data_path"]),
+        )
+
         manager.start_docker()
-        
-        # Ensure connection
-        print("\n3. Ensuring Neo4j is ready...")
         manager.ensure_connection()
-        
-        print("\n" + "="*80)
-        print("SUCCESS! Neo4j is ready")
-        print("="*80)
-        print(f"\nNeo4j Browser: http://localhost:{SOFI_NEO4J_CONFIG['http_port']}")
-        print(f"Username: {SOFI_NEO4J_CONFIG['username']}")
-        print(f"Password: {SOFI_NEO4J_CONFIG['password']}")
-        print(f"Database: {SOFI_NEO4J_CONFIG['database']}")
-        print("\nPress Ctrl+C to stop the container...")
-        
-        # Keep running until interrupted
+        observer.info(
+            "Neo4j ready for connections",
+            browser=f"http://localhost:{SOFI_NEO4J_CONFIG['http_port']}",
+            database=SOFI_NEO4J_CONFIG["database"],
+        )
+
         try:
             while True:
                 time.sleep(1)
         except KeyboardInterrupt:
-            print("\n\nStopping container...")
             manager.stop_docker()
-            print("Container stopped.")
-        
+
     except Exception as e:
-        logger.error(f"Error: {e}", exc_info=True)
-        print(f"\nError: {e}")
+        observer.error("docker_manager CLI failed", exception=e)
+        raise

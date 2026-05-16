@@ -6,10 +6,9 @@ Loaded once at MemoryManager.setup() via load_reranker().
 Applied to top-50 candidates after ACT-R heat scoring, before final tiering.
 """
 
-import logging
 from typing import List, Dict, Any
 
-logger = logging.getLogger(__name__)
+from memory.observability import observer
 
 _model = None  # CrossEncoder singleton — loaded lazily at startup
 
@@ -22,11 +21,11 @@ def load_reranker() -> None:
     try:
         from sentence_transformers import CrossEncoder
         _model = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
-        logger.info("Cross-encoder reranker loaded (ms-marco-MiniLM-L-6-v2)")
+        observer.info("cross-encoder reranker loaded", model="ms-marco-MiniLM-L-6-v2")
     except ImportError:
-        logger.warning("sentence-transformers not installed — reranker disabled")
+        observer.warning("sentence-transformers not installed — reranker disabled")
     except Exception as exc:
-        logger.warning(f"Reranker load failed: {exc} — reranker disabled")
+        observer.warning("reranker load failed", error=str(exc))
 
 
 def rerank(
@@ -37,8 +36,6 @@ def rerank(
     """
     Rerank up to top_n candidates by cross-encoder relevance to query.
     Returns original order if the model is unavailable or an error occurs.
-
-    Expected latency on top-50 candidates: 10–15ms (warm model).
     """
     if _model is None or not candidates:
         return candidates[:top_n]
@@ -49,5 +46,5 @@ def rerank(
         ranked = sorted(zip(scores, candidates), key=lambda x: x[0], reverse=True)
         return [m for _, m in ranked[:top_n]]
     except Exception as exc:
-        logger.warning(f"Reranker predict failed: {exc} — returning original order")
+        observer.warning("reranker predict failed", error=str(exc))
         return candidates[:top_n]

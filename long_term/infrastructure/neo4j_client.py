@@ -6,11 +6,10 @@ and performance optimization for the SOFI memory system's Layer 2 knowledge grap
 """
 
 import asyncio
-import logging
-from typing import Dict, List, Optional, Any, Union
+import json
 from contextlib import asynccontextmanager
 from datetime import datetime
-import json
+from typing import Dict, List, Optional, Any, Union
 
 try:
     from neo4j import AsyncGraphDatabase, AsyncDriver, AsyncSession, AsyncTransaction
@@ -23,8 +22,7 @@ except ImportError:
 from pydantic import BaseModel, Field
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
-
-logger = logging.getLogger(__name__)
+from memory.observability import observer
 
 
 class Neo4jConfig(BaseModel):
@@ -73,18 +71,18 @@ class Neo4jClient:
             # Test connection
             await self._test_connection()
             self._is_connected = True
-            logger.info(f"Successfully connected to Neo4j at {self.config.uri}")
-            
+            observer.info("connected to Neo4j", uri=self.config.uri)
+
         except Exception as e:
-            logger.error(f"Failed to connect to Neo4j: {e}")
+            observer.error("Neo4j connection failed", exception=e, uri=self.config.uri)
             raise
-    
+
     async def disconnect(self) -> None:
         """Close connection to Neo4j database"""
         if self.driver:
             await self.driver.close()
             self._is_connected = False
-            logger.info("Disconnected from Neo4j")
+            observer.info("disconnected from Neo4j")
     
     async def _test_connection(self) -> None:
         """Test database connection"""
@@ -121,13 +119,13 @@ class Neo4jClient:
                 return records
                 
         except (ServiceUnavailable, TransientError) as e:
-            logger.warning(f"Transient error executing query, retrying: {e}")
+            observer.warning("transient Neo4j error, retrying", error=str(e))
             raise
         except DatabaseError as e:
-            logger.error(f"Database error executing query: {e}")
+            observer.error("Neo4j database error", exception=e)
             raise
         except Exception as e:
-            logger.error(f"Unexpected error executing query: {e}")
+            observer.error("unexpected Neo4j query error", exception=e)
             raise
     
     @asynccontextmanager
@@ -151,7 +149,7 @@ class Neo4jClient:
                 await transaction.commit()
             except Exception as exc:
                 await transaction.rollback()
-                logger.error(f"Transaction rolled back: {exc}")
+                observer.error("Neo4j transaction rolled back", exception=exc)
                 raise
     
     async def create_constraints_and_indexes(self) -> None:
@@ -226,11 +224,8 @@ class Neo4jClient:
         for constraint_or_index in constraints_and_indexes:
             try:
                 await self.execute_query(constraint_or_index)
-                # Get a simple name for logging
-                name = constraint_or_index.split()[2]
-                logger.info(f"Created constraint/index: {name}")
             except Exception as e:
-                logger.warning(f"Failed to create constraint/index: {e}")
+                observer.warning("constraint/index creation failed", error=str(e))
     
     async def health_check(self) -> Dict[str, Any]:
         """Perform health check on database connection"""
@@ -284,7 +279,7 @@ class Neo4jClient:
                 "timestamp": datetime.now().isoformat()
             }
         except Exception as e:
-            logger.error(f"Failed to get database info: {e}")
+            observer.error("get_database_info failed", exception=e)
             return {"error": str(e)}
     
     def __del__(self):
@@ -297,9 +292,9 @@ class Neo4jClient:
         memory_manager.shutdown().
         """
         if self.driver and self._is_connected:
-            logger.warning(
-                "Neo4jClient was garbage-collected while still connected. "
-                "Call `await client.disconnect()` before discarding the client."
+            observer.warning(
+                "Neo4jClient GC'd while still connected — "
+                "call await client.disconnect() before discarding"
             )
 
 

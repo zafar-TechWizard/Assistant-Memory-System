@@ -17,7 +17,6 @@ Design principles (research-backed):
 import asyncio
 import datetime
 import json
-import logging
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -37,7 +36,7 @@ from memory.long_term.models.relationship_models import MemoryRelationshipType
 from memory.processing.embedding_utils import EmbeddingUtils
 from memory.long_term.memory_retrieval_engine import MemoryRetrievalEngine
 
-logger = logging.getLogger(__name__)
+from memory.observability import observer
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -170,7 +169,7 @@ class GroqClient:
             self._usage[tier] += estimated_tokens
             return resp.choices[0].message.content
         except Exception as exc:
-            logger.error(f"[groq] {tier} call failed: {exc}")
+            observer.error(f"[groq] {tier} call failed: {exc}")
             return None
 
     async def _maybe_wait(self, tier: str, tokens: int) -> None:
@@ -180,7 +179,6 @@ class GroqClient:
             self._reset_at = now
         if self._usage.get(tier, 0) + tokens > self.MODELS[tier]["tpm"]:
             wait = 60 - (now - self._reset_at).total_seconds()
-            logger.info(f"[groq] Rate limit — waiting {wait:.0f}s")
             await asyncio.sleep(max(wait, 0))
             self._usage = {k: 0 for k in self.MODELS}
             self._reset_at = datetime.datetime.now()
@@ -325,9 +323,9 @@ class ConversationAnalyzer:
                 data = json.loads(raw)
                 return self._parse(data, session_date)
             except (json.JSONDecodeError, KeyError) as exc:
-                logger.warning(f"[analyzer] Parse failed attempt {attempt + 1}: {exc}")
+                observer.warning(f"[analyzer] Parse failed attempt {attempt + 1}: {exc}")
 
-        logger.warning("[analyzer] All attempts failed — fallback extraction")
+        observer.warning("[analyzer] All attempts failed — fallback extraction")
         return self._fallback(conversations, session_date)
 
     def _parse(self, data: Dict, session_date: str) -> ExtractionResult:
@@ -449,7 +447,7 @@ class GraphMatcher:
             try:
                 matches = await self._match_one(mem)
             except Exception as exc:
-                logger.warning(f"[matcher] Match failed for index {mem.index}: {exc}")
+                observer.warning(f"[matcher] Match failed for index {mem.index}: {exc}")
                 matches = []
             results.append(MatchedMemory(extracted=mem, matches=matches))
         return results
@@ -534,7 +532,6 @@ class GraphMatcher:
                 similarity=min(float(r.get("score", 0)) / 5.0, 1.0),
             ) for r in rows]
         except Exception as exc:
-            logger.debug(f"[matcher] Knowledge BM25 failed: {exc}")
             return []
 
     async def _match_experience(self, mem: ExtractedMemory) -> List[ExistingMatch]:
@@ -587,7 +584,6 @@ class GraphMatcher:
                 similarity=min(float(r.get("score", 0)) / 5.0, 1.0),
             ) for r in rows]
         except Exception as exc:
-            logger.debug(f"[matcher] Experience BM25 failed: {exc}")
             return []
 
 
@@ -686,7 +682,7 @@ class ConflictResolver:
                 for r in parsed.get("resolutions", []):
                     resolutions[int(r["conflict_index"])] = r
             except (json.JSONDecodeError, KeyError, ValueError) as exc:
-                logger.warning(f"[resolver] Parse failed: {exc} — defaulting to ENHANCE")
+                observer.warning(f"[resolver] Parse failed: {exc} — defaulting to ENHANCE")
 
         for ci, (_, m) in enumerate(conflicts):
             res = resolutions.get(ci, {})
@@ -757,9 +753,8 @@ class MemoryWriter:
                 if node:
                     saved[plan.extracted.index] = node
             except Exception as exc:
-                logger.error(
+                observer.error(
                     f"[writer] {plan.operation} failed for index {plan.extracted.index}: {exc}",
-                    exc_info=True,
                 )
         return saved
 
@@ -769,7 +764,7 @@ class MemoryWriter:
             try:
                 result[idx] = self.embed.generate_embedding(text)
             except Exception as exc:
-                logger.warning(f"[writer] Embed failed for index {idx}: {exc}")
+                observer.warning(f"[writer] Embed failed for index {idx}: {exc}")
         return result
 
     async def _execute_one(
@@ -947,7 +942,7 @@ class MemoryWriter:
             if rows:
                 return SavedNode(m.index, target_id, str(rows[0].get("label", "")), "UPDATE")
         except Exception as exc:
-            logger.error(f"[writer] UPDATE failed for {target_id}: {exc}")
+            observer.error(f"[writer] UPDATE failed for {target_id}: {exc}")
         return None
 
     # ── ENHANCE ────────────────────────────────────────────────────────────────
@@ -997,7 +992,7 @@ class MemoryWriter:
             if rows:
                 return SavedNode(m.index, target_id, str(rows[0].get("label", "")), "ENHANCE")
         except Exception as exc:
-            logger.error(f"[writer] ENHANCE failed for {target_id}: {exc}")
+            observer.error(f"[writer] ENHANCE failed for {target_id}: {exc}")
         return None
 
     # ── Helpers ────────────────────────────────────────────────────────────────
@@ -1015,7 +1010,7 @@ class MemoryWriter:
                 {"old_id": old_id, "new_id": new_id, "now": now},
             )
         except Exception as exc:
-            logger.warning(f"[writer] SUPERSEDED_BY failed: {exc}")
+            observer.warning(f"[writer] SUPERSEDED_BY failed: {exc}")
 
     async def _reinforce(self, node_id: str, now: str) -> None:
         """SKIP: existing already captures it — reinforce its ACT-R access stats."""
@@ -1029,7 +1024,7 @@ class MemoryWriter:
                 {"node_id": node_id, "now": now},
             )
         except Exception as exc:
-            logger.warning(f"[writer] Reinforce failed for {node_id}: {exc}")
+            observer.warning(f"[writer] Reinforce failed for {node_id}: {exc}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1121,8 +1116,8 @@ class GraphLinker:
                 """,
                 {"exp_id": exp_id, "person": person, "now": now},
             )
-        except Exception as exc:
-            logger.debug(f"[linker] exp→person failed ({person}): {exc}")
+        except Exception:
+            pass
 
     async def _temporal_chain(
         self, new_id: str, participants: List[str], timestamp: Optional[str], now: str
@@ -1151,7 +1146,7 @@ class GraphLinker:
                  "participants": participants, "now": now},
             )
         except Exception as exc:
-            logger.debug(f"[linker] temporal chain failed: {exc}")
+            pass
 
     async def _person_to_experiences(self, rel_id: str, person_name: str, now: str) -> None:
         """Backfill: link updated RelationshipMemory to all existing experiences mentioning them."""
@@ -1170,7 +1165,7 @@ class GraphLinker:
                 {"rel_id": rel_id, "person": person_name, "now": now},
             )
         except Exception as exc:
-            logger.debug(f"[linker] person→experiences failed ({person_name}): {exc}")
+            pass
 
     async def _knowledge_hierarchy(
         self, know_id: str, related: List[str], now: str
@@ -1188,7 +1183,7 @@ class GraphLinker:
                 {"know_id": know_id, "related_lower": [r.lower() for r in related], "now": now},
             )
         except Exception as exc:
-            logger.debug(f"[linker] knowledge hierarchy failed: {exc}")
+            pass
 
     async def _merge_edge(
         self, from_id: str, to_id: str, rel_type: str, strength: float, now: str
@@ -1208,7 +1203,7 @@ class GraphLinker:
                 {"from_id": from_id, "to_id": to_id, "strength": strength, "now": now},
             )
         except Exception as exc:
-            logger.debug(f"[linker] edge {safe_type} failed: {exc}")
+            pass
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1247,12 +1242,10 @@ class ConsolidationEngine:
         self.writer   = MemoryWriter(neo4j, embed)
         self.linker   = GraphLinker(neo4j)
 
-        logger.info("[consolidation] Engine initialized (5-stage pipeline)")
 
     # ── Scheduler ─────────────────────────────────────────────────────────────
 
     async def start_scheduler(self) -> None:
-        logger.info("[consolidation] Scheduler started")
         self.is_running = True
         while self.is_running:
             try:
@@ -1260,12 +1253,11 @@ class ConsolidationEngine:
                 if self.TRIGGER_HOUR <= now.hour < self.TRIGGER_HOUR + 1:
                     await self.run_consolidation_once()
                     sleep_s = self._seconds_until_tomorrow()
-                    logger.info(f"[consolidation] Next run in {sleep_s / 3600:.1f}h")
                     await asyncio.sleep(sleep_s)
                 else:
                     await asyncio.sleep(3600)
             except Exception as exc:
-                logger.error(f"[consolidation] Scheduler error: {exc}", exc_info=True)
+                observer.error(f"[consolidation] Scheduler error: {exc}")
                 await asyncio.sleep(3600)
 
     def _seconds_until_tomorrow(self) -> float:
@@ -1276,7 +1268,6 @@ class ConsolidationEngine:
     # ── Main entry ─────────────────────────────────────────────────────────────
 
     async def run_consolidation_once(self) -> Dict[str, Any]:
-        logger.info("[consolidation] ── RUN START ──────────────────────────────")
         stats = {
             "sessions_attempted": 0, "sessions_succeeded": 0,
             "memories_created": 0, "memories_updated": 0, "sessions_failed": 0,
@@ -1284,13 +1275,11 @@ class ConsolidationEngine:
 
         log_data = self._load_log()
         if not log_data:
-            logger.info("[consolidation] No conversation data")
             return stats
 
         user_key = f"user_{self.cfg.user_id}"
         sessions = log_data.get(user_key, [])
         if not sessions:
-            logger.info(f"[consolidation] No sessions for {self.cfg.user_id}")
             return stats
 
         keep = []
@@ -1301,24 +1290,18 @@ class ConsolidationEngine:
             if not convs:
                 continue
 
-            logger.info(f"[consolidation] Processing {sid} ({len(convs)} turns)")
             try:
                 result = await self._consolidate_session(convs, sid)
                 stats["sessions_succeeded"] += 1
                 stats["memories_created"] += result["created"]
                 stats["memories_updated"] += result["updated"]
-                logger.info(
-                    f"[consolidation] ✓ {sid} — "
-                    f"created={result['created']} updated={result['updated']}"
-                )
             except Exception as exc:
-                logger.error(f"[consolidation] ✗ {sid}: {exc}", exc_info=True)
+                observer.error(f"[consolidation] ✗ {sid}: {exc}")
                 keep.append(session)
                 stats["sessions_failed"] += 1
 
         log_data[user_key] = keep
         self._save_log(log_data)
-        logger.info(f"[consolidation] ── COMPLETE — {stats} ──────────────────")
         return stats
 
     async def _consolidate_session(
@@ -1327,36 +1310,25 @@ class ConsolidationEngine:
         session_date = datetime.date.today().isoformat()
 
         # Stage 1
-        logger.debug(f"[{session_id}] Stage 1: extracting")
         extraction = await self.analyzer.analyze(conversations, self.cfg.user_id, session_date)
         if not extraction.memories:
-            logger.info(f"[{session_id}] Nothing worth storing")
             return {"created": 0, "updated": 0}
 
-        logger.debug(f"[{session_id}] Extracted {len(extraction.memories)} memories, "
-                     f"{len(extraction.edges)} edges")
 
         # Stage 2
-        logger.debug(f"[{session_id}] Stage 2: matching")
         matched = await self.matcher.match_all(extraction.memories)
         conflicts = sum(1 for m in matched if m.matches)
-        logger.debug(f"[{session_id}] {conflicts} conflicts")
 
         # Stage 3
-        logger.debug(f"[{session_id}] Stage 3: resolving")
         plans = await self.resolver.resolve(matched)
         ops: Dict[str, int] = {}
         for p in plans:
             ops[p.operation] = ops.get(p.operation, 0) + 1
-        logger.debug(f"[{session_id}] Operations: {ops}")
 
         # Stage 4
-        logger.debug(f"[{session_id}] Stage 4: writing")
         saved = await self.writer.execute(plans)
-        logger.debug(f"[{session_id}] Saved {len(saved)} nodes")
 
         # Stage 5
-        logger.debug(f"[{session_id}] Stage 5: linking")
         await self.linker.link(saved, extraction)
 
         created = sum(1 for p in plans if p.operation == "CREATE")
@@ -1371,14 +1343,14 @@ class ConsolidationEngine:
         try:
             return json.loads(self.log_path.read_text(encoding="utf-8"))
         except Exception as exc:
-            logger.error(f"[consolidation] Load log failed: {exc}")
+            observer.error(f"[consolidation] Load log failed: {exc}")
             return {}
 
     def _save_log(self, data: Dict) -> None:
         try:
             self.log_path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
         except Exception as exc:
-            logger.error(f"[consolidation] Save log failed: {exc}")
+            observer.error(f"[consolidation] Save log failed: {exc}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1406,7 +1378,6 @@ if __name__ == "__main__":
         embed = EmbeddingUtils()
         engine = ConsolidationEngine(neo4j, embed)
         stats = await engine.run_consolidation_once()
-        print(f"Done: {stats}")
         await neo4j.disconnect()
 
     asyncio.run(main())

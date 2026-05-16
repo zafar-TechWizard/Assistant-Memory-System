@@ -5,11 +5,8 @@ from pathlib import Path
 from datetime import datetime, timedelta
 from uuid import uuid4
 from typing import Optional
-from utils.logger import UniversalLogger
 from memory.config import config
-
-
-logger = UniversalLogger.get_logger("conversation_logger")
+from memory.observability import observer
 
 
 class ConversationLogger:
@@ -47,9 +44,11 @@ class ConversationLogger:
         # log_message() simultaneously (load-modify-save race condition).
         self._lock = threading.Lock()
 
-        logger.info(
-            f"ConversationLogger initialized: user={self.user}, "
-            f"filepath={self.filepath}, timeout={timeout_minutes}min"
+        observer.info(
+            "ConversationLogger initialized",
+            user=self.user,
+            filepath=self.filepath,
+            timeout_min=timeout_minutes,
         )
 
     def _load_data(self) -> dict:
@@ -63,7 +62,7 @@ class ConversationLogger:
             with open(self.filepath, 'r', encoding='utf-8') as f:
                 return json.load(f)
         except (json.JSONDecodeError, FileNotFoundError) as e:
-            logger.warning(f"Could not load conversation data: {e}")
+            observer.warning("could not load conversation data", error=str(e))
             return {}
 
     def _save_data(self, data: dict):
@@ -72,7 +71,7 @@ class ConversationLogger:
             with open(self.filepath, 'w', encoding='utf-8') as f:
                 json.dump(data, f, indent=2, ensure_ascii=False)
         except Exception as e:
-            logger.error(f"Error saving conversation data: {e}")
+            observer.error("conversation data save failed", exception=e)
             raise
 
     def _create_new_session(self) -> dict:
@@ -117,13 +116,12 @@ class ConversationLogger:
                 # Check if the last message is within the timeout window
                 if now - last_message_time.replace(tzinfo=None) < self.session_timeout:
                     current_session = last_session
-                    logger.debug(f"Continuing existing session: {current_session['session_id']}")
 
         # If no active session, create a new one
         if not current_session:
             current_session = self._create_new_session()
             user_sessions.append(current_session)
-            logger.info(f"Starting new session: {current_session['session_id']}")
+            observer.info("new conversation session", session_id=current_session["session_id"])
 
         # Create the new message "turn"
         new_turn = {
@@ -138,7 +136,6 @@ class ConversationLogger:
         # Update the data and save it
         all_data[user_key] = user_sessions
         self._save_data(all_data)
-        logger.debug(f"Logged message for {self.user} in role {role}")
         # (lock released by context manager in log_message)
     
     def get_current_session(self) -> dict:

@@ -34,9 +34,7 @@ from enum import Enum
 from typing import Any, Callable, Dict, List, Optional
 
 from memory.config import config
-from utils.logger import UniversalLogger
-
-logger = UniversalLogger.get_logger("working_context")
+from memory.observability import observer
 
 
 # =============================================================================
@@ -221,10 +219,6 @@ class AgenticWorkspace:
         """Add a new item. Returns its id."""
         with self._lock:
             self._items.append(item)
-            logger.info(
-                f"[workspace] + {item.type.value} '{item.title}' "
-                f"notify={item.notify} priority={item.notify_priority.value}"
-            )
             return item.id
 
     def update_item(self, item_id: str, **kwargs) -> bool:
@@ -240,11 +234,9 @@ class AgenticWorkspace:
                         if hasattr(item, key):
                             setattr(item, key, value)
                         else:
-                            logger.warning(f"[workspace] Unknown field '{key}' on WorkspaceItem")
+                            observer.warning("workspace unknown field", field=key)
                     item.updated_at = datetime.now()
-                    logger.debug(f"[workspace] Updated '{item.title}': {kwargs}")
                     return True
-            logger.warning(f"[workspace] update_item: id '{item_id}' not found")
             return False
 
     def remove_item(self, item_id: str) -> bool:
@@ -252,10 +244,7 @@ class AgenticWorkspace:
         with self._lock:
             before = len(self._items)
             self._items = [i for i in self._items if i.id != item_id]
-            removed = len(self._items) < before
-            if removed:
-                logger.debug(f"[workspace] Removed item '{item_id}'")
-            return removed
+            return len(self._items) < before
 
     # ── Read (return copies to avoid external mutation) ───────────────────────
 
@@ -372,7 +361,7 @@ class WorkingContextManager:
         # Kick off the background datetime timer immediately
         self._start_datetime_timer()
 
-        logger.info("WorkingContextManager initialised")
+        observer.info("WorkingContextManager initialised")
 
     # ── Memory section update ─────────────────────────────────────────────────
 
@@ -404,10 +393,6 @@ class WorkingContextManager:
                     signals_fired=retrieval_meta.get("signals_fired", []),
                     latency_ms=retrieval_meta.get("latency_ms", 0.0),
                 )
-        logger.debug(
-            f"[wc] Memory updated: must={len(must_know or [])} "
-            f"ctx={len(context or [])} assoc={len(associations or [])}"
-        )
 
     # ── SOFi section update ───────────────────────────────────────────────────
 
@@ -421,7 +406,7 @@ class WorkingContextManager:
                 if hasattr(self._sofi, key):
                     setattr(self._sofi, key, value)
                 else:
-                    logger.warning(f"[wc] Unknown SofiState field: '{key}'")
+                    observer.warning("unknown SofiState field", field=key)
 
     # ── User section update ───────────────────────────────────────────────────
 
@@ -435,7 +420,7 @@ class WorkingContextManager:
                 if hasattr(self._user, key):
                     setattr(self._user, key, value)
                 else:
-                    logger.warning(f"[wc] Unknown UserState field: '{key}'")
+                    observer.warning("unknown UserState field", field=key)
 
     # ── Workspace access (direct reference — has its own lock) ────────────────
 
