@@ -16,6 +16,25 @@ except ImportError:
     Matcher = None
     PhraseMatcher = None
 
+# GLiNER: zero-shot NER with custom entity types. Optional dependency.
+# Install: pip install gliner
+# Catches concept-level entities (project, event, topic, emotion) that spaCy misses.
+try:
+    from gliner import GLiNER
+    GLINER_AVAILABLE = True
+except ImportError:
+    GLINER_AVAILABLE = False
+    GLiNER = None
+
+# coreferee: spaCy plugin for co-reference resolution. Optional dependency.
+# Install: pip install coreferee && python -m coreferee install en
+# Resolves "she", "him", "they", "that" to their antecedents across turns.
+try:
+    import coreferee  # noqa: F401  (imported for spaCy pipe registration)
+    COREFEREE_AVAILABLE = True
+except ImportError:
+    COREFEREE_AVAILABLE = False
+
 from utils.logger import UniversalLogger
 
 logger = UniversalLogger.get_logger("entity_extraction")
@@ -92,32 +111,46 @@ class EntityExtractor:
     # Old entries are evicted LRU-style when this limit is reached.
     _CACHE_MAX_SIZE: int = 512
     
+    # GLiNER labels for personal-AI conversational text.
+    # Broader than spaCy's NER — catches concept-level entities humans actually
+    # reference in conversation.
+    _GLINER_LABELS = [
+        "person", "place", "organization", "project", "event",
+        "topic", "emotion", "skill", "tool", "concept", "goal", "relationship",
+    ]
+
     def __init__(
         self,
         spacy_model: str = "en_core_web_sm",
         custom_patterns: Optional[List[Dict[str, Any]]] = None,
         enable_caching: bool = True,
         strict_spacy: bool = False,
-        confidence_threshold: float = 0.5
+        confidence_threshold: float = 0.5,
+        use_gliner: bool = True,
+        gliner_model: str = "urchade/gliner_medium-v2.1",
+        use_coreferee: bool = True,
     ):
         """
         Initialize entity extractor.
-        
+
         Args:
             spacy_model: spaCy model name (default: en_core_web_sm)
             custom_patterns: List of custom entity patterns
             enable_caching: Enable entity caching for performance
             strict_spacy: Raise error if spaCy unavailable (default: False)
             confidence_threshold: Minimum confidence to include entity
+            use_gliner: Try to load GLiNER for richer concept-level extraction
+            gliner_model: GLiNER checkpoint to load (medium ~70MB)
+            use_coreferee: Try to add coreferee to spaCy pipeline for pronoun resolution
         """
         self.spacy_model = spacy_model
         self.confidence_threshold = confidence_threshold
         self.enable_caching = enable_caching
-        
-        # Try to load spaCy
+
+        # ── Load spaCy ───────────────────────────────────────────────────────
         self.nlp = None
         self.spacy_available = False
-        
+
         if SPACY_AVAILABLE:
             try:
                 self.nlp = spacy.load(spacy_model)
@@ -129,16 +162,42 @@ class EntityExtractor:
                         f"spaCy model '{spacy_model}' not available. "
                         f"Install with: python -m spacy download {spacy_model}"
                     )
-                logger.warning(
-                    f"spaCy not available, using fallback extraction: {e}"
-                )
+                logger.warning(f"spaCy not available, using fallback extraction: {e}")
         else:
             if strict_spacy:
-                raise RuntimeError(
-                    "spaCy not installed. Install with: pip install spacy"
-                )
+                raise RuntimeError("spaCy not installed. Install with: pip install spacy")
             logger.warning("⚠ spaCy not installed, using fallback extraction")
-        
+
+        # ── Add coreferee to spaCy pipeline (pronoun resolution) ─────────────
+        self.coref_available = False
+        if use_coreferee and self.spacy_available and COREFEREE_AVAILABLE:
+            try:
+                if "coreferee" not in self.nlp.pipe_names:
+                    self.nlp.add_pipe("coreferee")
+                self.coref_available = True
+                logger.info("Added coreferee to spaCy pipeline (pronoun resolution enabled)")
+            except Exception as e:
+                logger.warning(f"coreferee unavailable: {e}")
+        elif use_coreferee and not COREFEREE_AVAILABLE:
+            logger.info(
+                "coreferee not installed — pronoun resolution disabled. "
+                "Install: pip install coreferee && python -m coreferee install en"
+            )
+
+        # ── Load GLiNER (zero-shot NER with custom labels) ───────────────────
+        self.gliner_model = None
+        if use_gliner and GLINER_AVAILABLE:
+            try:
+                self.gliner_model = GLiNER.from_pretrained(gliner_model)
+                logger.info(f"Loaded GLiNER model: {gliner_model}")
+            except Exception as e:
+                logger.warning(f"GLiNER load failed — falling back to spaCy NER: {e}")
+        elif use_gliner and not GLINER_AVAILABLE:
+            logger.info(
+                "GLiNER not installed — using spaCy NER only. "
+                "Install: pip install gliner"
+            )
+
         # Initialize matchers if spaCy available
         if self.spacy_available:
             self.matcher = Matcher(self.nlp.vocab)
@@ -199,9 +258,10 @@ class EntityExtractor:
             self._cache.move_to_end(cache_key)
             return self._cache[cache_key]
         
-        # Extract entities
-        if self.spacy_available:
-            entities = self._extract_with_spacy(text)
+        # Extract entities — prefer the unified pipeline when GLiNER or spaCy is
+        # available. Falls back to pure heuristics only if neither is loaded.
+        if self.gliner_model is not None or self.spacy_available:
+            entities = self._extract_combined(text, text)
         else:
             entities = self._extract_with_heuristics(text)
         
@@ -230,14 +290,239 @@ class EntityExtractor:
     def extract_entities_detailed(self, text: str) -> Dict[str, List[Entity]]:
         """
         Extract entities with full metadata (convenience method).
-        
-        Args:
-            text: Input text
-            
-        Returns:
-            Dictionary mapping entity types to Entity objects
         """
         return self.extract_entities(text, return_format="detailed")
+
+    def extract_entities_with_context(
+        self,
+        current_message: str,
+        recent_messages: Optional[List[str]] = None,
+        return_format: str = "simple",
+    ) -> Union[List[str], Dict[str, List[Entity]]]:
+        """
+        Sliding-window entity extraction.
+
+        Combines recent_messages + current_message so that pronouns and implicit
+        references in the current message resolve against entities mentioned in
+        recent turns. Three real-world scenarios this fixes:
+
+          Turn N-1: "I had a fight with Sarah yesterday."
+          Turn N  : "she keeps doing this."   ← current message has zero entities
+                    → sliding window sees "Sarah" from N-1 and surfaces it
+                    → coreference (if available) explicitly resolves "she" → Sarah
+
+          Turn N-1: "The deployment failed twice today."
+          Turn N  : "I'm stressed about it."
+                    → "deployment" is recovered as the topic anchor
+
+          Turn N-1: "Mike from the team didn't show up."
+          Turn N  : "he's been unreliable lately."
+                    → "Mike" recovered, EXPERIENCE_TO_RELATIONSHIP path activates
+
+        Returns the same shape as extract_entities — drop-in replacement when
+        you have recent context available.
+        """
+        if not current_message or not current_message.strip():
+            return [] if return_format == "simple" else {}
+
+        recent_messages = recent_messages or []
+
+        # Cache key includes both current and context — same context returns same result
+        cache_key = f"ctx::{return_format}::{'|'.join(recent_messages[-3:])}::{current_message}"
+        if self._cache is not None and cache_key in self._cache:
+            self._cache.move_to_end(cache_key)
+            return self._cache[cache_key]
+
+        # Combine for extraction. Newline separation keeps spaCy/GLiNER's sentence
+        # boundaries clean — they treat each turn as its own sentence cluster but
+        # coreference still spans them.
+        combined = "\n".join(recent_messages[-3:] + [current_message])
+
+        entities = self._extract_combined(combined, current_message)
+        entities = [e for e in entities if e.confidence >= self.confidence_threshold]
+        result = self._format_output(entities, return_format)
+
+        if self._cache is not None:
+            self._cache[cache_key] = result
+            self._cache.move_to_end(cache_key)
+            if len(self._cache) > self._CACHE_MAX_SIZE:
+                self._cache.popitem(last=False)
+
+        logger.debug(
+            f"[ctx-extract] {len(entities)} entities from "
+            f"{len(recent_messages)} recent turns + current"
+        )
+        return result
+
+    def _extract_combined(self, combined_text: str, current_message: str) -> List[Entity]:
+        """
+        Extract entities from combined recent+current text.
+
+        Pipeline:
+        1. GLiNER if available (best for concept-level entities)
+        2. spaCy NER + noun chunks (named entities + concepts)
+        3. coreferee chains expanded into the current message (pronoun → antecedent)
+
+        All sources merge through _deduplicate_entities. Confidence preferences:
+          GLiNER (0.80) ≥ phrase_match (0.95) > custom (0.90) > NER (0.85) > coref (0.78) > chunk (0.70)
+        """
+        entities: List[Entity] = []
+
+        # ── GLiNER (preferred when available) ────────────────────────────────
+        if self.gliner_model is not None:
+            try:
+                glin = self.gliner_model.predict_entities(
+                    combined_text, self._GLINER_LABELS, threshold=0.5,
+                )
+                for g in glin:
+                    text = str(g.get("text", "")).strip()
+                    if not text or len(text) < 2:
+                        continue
+                    label_raw = str(g.get("label", "concept"))
+                    entities.append(Entity(
+                        text=text,
+                        normalized_text=text.lower(),
+                        type=self._gliner_label_to_type(label_raw),
+                        category=self._gliner_label_to_category(label_raw),
+                        confidence=float(g.get("score", 0.8)),
+                        start_char=int(g.get("start", 0)),
+                        end_char=int(g.get("end", 0)),
+                        metadata={"source": "gliner", "gliner_label": label_raw},
+                    ))
+            except Exception as exc:
+                logger.warning(f"[gliner] inference failed: {exc}")
+
+        # ── spaCy NER + custom matchers + noun chunks ─────────────────────────
+        if self.spacy_available:
+            try:
+                spacy_entities = self._extract_with_spacy(combined_text)
+                entities.extend(spacy_entities)
+
+                # Coreference: walk every chain and surface the antecedent for
+                # any pronoun that lies inside the current_message portion.
+                if self.coref_available:
+                    coref_entities = self._extract_coreference_referents(
+                        combined_text, current_message,
+                    )
+                    entities.extend(coref_entities)
+            except Exception as exc:
+                logger.warning(f"[spacy] extraction failed: {exc}")
+        elif self.gliner_model is None:
+            # Neither GLiNER nor spaCy — fallback heuristics
+            entities.extend(self._extract_with_heuristics(combined_text))
+
+        return self._deduplicate_entities(entities)
+
+    def _extract_coreference_referents(
+        self, combined_text: str, current_message: str,
+    ) -> List[Entity]:
+        """
+        Use coreferee to resolve pronouns. For each chain, if any mention falls
+        inside the current_message portion of combined_text, surface the head
+        (canonical antecedent) as an entity.
+
+        Example chain: ["Sarah" @0..5, "she" @45..48, "her" @80..83]
+        If "she" or "her" is inside the current message, we surface "Sarah".
+        """
+        out: List[Entity] = []
+        try:
+            doc = self.nlp(combined_text)
+        except Exception as exc:
+            logger.debug(f"[coref] doc parse failed: {exc}")
+            return out
+
+        chains = getattr(doc._, "coref_chains", None)
+        if not chains:
+            return out
+
+        # Locate current_message span inside combined_text (last occurrence)
+        msg_start = combined_text.rfind(current_message)
+        if msg_start < 0:
+            msg_start = 0
+        msg_end = msg_start + len(current_message)
+
+        for chain in chains:
+            # chain.mentions is a list of Mention objects with token_indexes
+            # The "head" is the most informative antecedent
+            try:
+                head_idx = getattr(chain, "most_specific_mention_index", 0)
+                mentions = getattr(chain, "mentions", None)
+                if mentions is None:
+                    # Some coreferee versions expose mentions via indexing on chain
+                    try:
+                        head_mention = chain[head_idx]
+                        mentions = [chain[i] for i in range(len(chain))]
+                    except (TypeError, IndexError):
+                        continue
+                else:
+                    head_mention = mentions[head_idx]
+
+                head_tokens = [doc[i] for i in head_mention.token_indexes]
+                head_text = " ".join(t.text for t in head_tokens).strip()
+                if not head_text or len(head_text) < 2:
+                    continue
+
+                # Does any pronoun mention in this chain fall in the current message?
+                touches_current = False
+                for mention in mentions:
+                    for tok_i in mention.token_indexes:
+                        tok = doc[tok_i]
+                        if msg_start <= tok.idx < msg_end:
+                            touches_current = True
+                            break
+                    if touches_current:
+                        break
+
+                if not touches_current:
+                    continue
+
+                # Avoid surfacing the head itself if it's just a pronoun
+                if head_text.lower() in {"he", "she", "it", "they", "him", "her", "them"}:
+                    continue
+
+                out.append(Entity(
+                    text=head_text,
+                    normalized_text=head_text.lower(),
+                    type=EntityType.PERSON,   # coref antecedents in conversation are usually people
+                    category=EntityCategory.TANGIBLE,
+                    confidence=0.78,
+                    start_char=head_tokens[0].idx,
+                    end_char=head_tokens[-1].idx + len(head_tokens[-1]),
+                    metadata={"source": "coreference", "chain_len": len(chain.mentions)},
+                ))
+            except Exception as exc:
+                logger.debug(f"[coref] chain processing failed: {exc}")
+                continue
+
+        return out
+
+    def _gliner_label_to_type(self, label: str) -> EntityType:
+        """Map GLiNER labels to internal EntityType."""
+        mapping = {
+            "person":        EntityType.PERSON,
+            "organization":  EntityType.ORGANIZATION,
+            "place":         EntityType.LOCATION,
+            "project":       EntityType.EVENT,
+            "event":         EntityType.EVENT,
+            "topic":         EntityType.CONCEPT,
+            "emotion":       EntityType.CONCEPT,
+            "skill":         EntityType.CONCEPT,
+            "tool":          EntityType.PRODUCT,
+            "concept":       EntityType.CONCEPT,
+            "goal":          EntityType.CONCEPT,
+            "relationship":  EntityType.PERSON,
+        }
+        return mapping.get(label.lower(), EntityType.CONCEPT)
+
+    def _gliner_label_to_category(self, label: str) -> EntityCategory:
+        tangible = {"person", "place", "organization", "tool", "relationship"}
+        intangible = {"topic", "emotion", "skill", "concept", "goal", "project", "event"}
+        ll = label.lower()
+        if ll in tangible:
+            return EntityCategory.TANGIBLE
+        if ll in intangible:
+            return EntityCategory.INTANGIBLE
+        return EntityCategory.INTANGIBLE
     
     def add_custom_pattern(
         self,

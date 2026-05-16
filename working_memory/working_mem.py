@@ -193,20 +193,58 @@ class WorkingMemory:
         try:
             logger.info(f"[reactive] {role} message ({len(content)} chars)")
 
-            # ── 1. Entity extraction ──────────────────────────────────────────
-            entities: Set[str] = set(
+            # ── 1. Entity extraction (two passes) ─────────────────────────────
+            # 1a) Current-only entities — drive active_entities tracking/expiry
+            current_only: Set[str] = set(
                 self.entity_extractor.extract_entities(content)
             )
-            logger.debug(f"[reactive] entities: {entities}")
 
-            # ── 2. Update active entities ─────────────────────────────────────
+            # 1b) Sliding-window entities — combine last 3 turns + current for
+            #     pronoun resolution and topic anchoring. "she" in the current
+            #     message resolves to "Sarah" if Sarah appeared 2 turns ago.
+            try:
+                recent_raw = self.conversation_logger.get_conversation_history(max_turns=3)
+                recent_texts = [t.get("content", "") for t in (recent_raw or [])][-3:]
+            except Exception:
+                recent_texts = []
+
+            if recent_texts and hasattr(self.entity_extractor, "extract_entities_with_context"):
+                context_entities: Set[str] = set(
+                    self.entity_extractor.extract_entities_with_context(
+                        current_message=content,
+                        recent_messages=recent_texts,
+                    )
+                )
+            else:
+                context_entities = set(current_only)
+
+            # ── 2. Active entity propagation ──────────────────────────────────
+            # If current message has NO entities (e.g. "I'm stressed"), inherit
+            # currently warm entities so retrieval still has an anchor.
             with self._state_lock:
-                self._state["current_entities"] = list(entities)
-                new_entities = self._update_active_entities(entities)
+                active_keys = set(self._state["active_entities"].keys())
 
+            if not current_only and not context_entities and active_keys:
+                logger.debug(
+                    f"[reactive] No entities extracted — inheriting active: {active_keys}"
+                )
+                retrieval_entities = active_keys
+            else:
+                # Prefer sliding-window entities for richer retrieval anchoring;
+                # falls back to current-only if window is empty.
+                retrieval_entities = context_entities or current_only
+
+            # ── 3. Update active_entities with CURRENT message entities only ──
+            # Only entities truly in the current message refresh expiry —
+            # sliding-window entities are anchors, not "currently active".
+            with self._state_lock:
+                self._state["current_entities"] = list(current_only)
+                new_entities = self._update_active_entities(current_only)
+
+            entities = retrieval_entities   # alias used downstream
             logger.debug(
-                f"[reactive] {len(new_entities)} new entities "
-                f"(will trigger LTM retrieval)"
+                f"[reactive] current={current_only} context={context_entities} "
+                f"retrieval={retrieval_entities} new={new_entities}"
             )
 
             # ── 3. LTM retrieval — router or fallback ─────────────────────────
