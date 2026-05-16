@@ -462,6 +462,9 @@ class MemoryRouter:
         self._engine     = engine
         self._classifier = IntentClassifier()
         self._coverage   = CoverageChecker()
+        # Surfaced in retrieval_meta after each _package call so callers / review
+        # traces can see if the confidence filter had to relax below the strict default.
+        self._last_confidence_threshold: float = 0.4
         observer.info("MemoryRouter ready")
 
     # -------------------------------------------------------------------------
@@ -557,6 +560,14 @@ class MemoryRouter:
 
         ms = (time.perf_counter() - t0) * 1000
 
+        # Surface the confidence threshold that survived to retrieval as a signal —
+        # makes it visible in review traces and retrieval_meta. A value below 0.4
+        # means the system had to relax because too few high-confidence memories
+        # were available (graph is sparse for this query).
+        signals = list(ir.signals_fired)
+        if self._last_confidence_threshold < 0.4:
+            signals.append(f"confidence_relaxed_to_{self._last_confidence_threshold:.1f}")
+
         return RoutedMemories(
             intent=ir.primary_intent,
             confidence=ir.confidence,
@@ -564,7 +575,7 @@ class MemoryRouter:
             context=context,
             associations=associations,
             emotional_baseline=emotional_baseline,
-            signals_fired=ir.signals_fired,
+            signals_fired=signals,
             latency_ms=ms,
         )
 
@@ -829,6 +840,62 @@ class MemoryRouter:
         "ambient":   0.05,
     }
 
+    # Dynamic confidence filter — starts strict, relaxes when too few survive.
+    # Default 0.4 cuts noisy low-confidence consolidation output. If fewer than
+    # _MIN_RESULTS_AFTER_FILTER memories pass, step through progressively lower
+    # thresholds until either enough survive or we hit the floor.
+    # Coverage-backup memories ALWAYS pass (they were specifically retrieved
+    # to fill known gaps — confidence filter shouldn't second-guess them).
+    _CONFIDENCE_STEPS: List[float] = [0.4, 0.3, 0.2, 0.1, 0.0]
+    _MIN_RESULTS_AFTER_FILTER: int = 3
+
+    @staticmethod
+    def _memory_confidence(m: Dict) -> float:
+        """Confidence value with safe defaults. Missing field → 1.0 (treat as high-conf)."""
+        c = m.get("confidence")
+        if c is None:
+            return 1.0
+        try:
+            return float(c)
+        except (TypeError, ValueError):
+            return 1.0
+
+    def _apply_confidence_filter(
+        self, memories: List[Dict]
+    ) -> Tuple[List[Dict], float]:
+        """
+        Dynamic confidence-based filter with auto-relaxation.
+
+        Algorithm:
+          1. Coverage-backup memories pass unconditionally (always relevant).
+          2. For each threshold in _CONFIDENCE_STEPS (starting at 0.4):
+               filter regular candidates by confidence >= threshold.
+               If coverage + filtered >= _MIN_RESULTS_AFTER_FILTER → return.
+          3. If the strictest threshold yields too few AND the loosest still
+             gives too few, return everything (graph is genuinely sparse;
+             refusing memories at this point hurts more than it helps).
+
+        Returns (filtered_memories, threshold_actually_used). The threshold is
+        surfaced in retrieval_meta so the review trace shows whether the system
+        had to relax — a signal that the graph is undersupplied for that query.
+        """
+        if not memories:
+            return [], 0.0
+
+        # Coverage memories always pass — they were targeted retrievals
+        coverage = [m for m in memories if m.get("_coverage_source")]
+        candidates = [m for m in memories if not m.get("_coverage_source")]
+
+        # Try progressively looser thresholds
+        for threshold in self._CONFIDENCE_STEPS:
+            filtered = [m for m in candidates
+                        if self._memory_confidence(m) >= threshold]
+            if len(coverage) + len(filtered) >= self._MIN_RESULTS_AFTER_FILTER:
+                return coverage + filtered, threshold
+
+        # Floor — return everything. Better to show low-confidence memories than nothing.
+        return memories, 0.0
+
     def _heat_score(self, memory: Dict, entities: List[str], intent: str = "entity") -> float:
         """
         ACT-R-inspired composite score with intent-aware temporal decay.
@@ -896,23 +963,31 @@ class MemoryRouter:
         intent: str = "entity",
     ) -> Tuple[List[Dict], List[Dict], List[Dict]]:
         """
-        1. Score every result with ACT-R heat score (intent-aware decay + recency bonus)
-        2. Deduplicate by id
-        3. Sort descending
-        4. Cross-encoder rerank top-50 for semantic correctness
-        5. Split tiers:
-             _recency_boosted  → must_know  (recent window scan results always surface first)
+        1. Dynamic confidence filter (auto-relaxes if too few memories survive)
+        2. Score every survivor with ACT-R heat score
+        3. Deduplicate by id
+        4. Sort descending
+        5. Cross-encoder rerank top-50
+        6. Split tiers:
+             _recency_boosted  → must_know  (recent window scan results)
              _coverage_source  → must_know  (coverage-verified)
              _tier_hint=assoc  → associations
              top 1/3 of rest   → must_know
              next 1/3          → context
              bottom 1/3        → associations
-        6. Hard-cap each tier
+        7. Hard-cap each tier
         """
         ents = entities or []
         backup_ids: Set[str] = {
             str(m.get("id", "")) for m in backup if m.get("id")
         }
+
+        # ── 0. Dynamic confidence filter ─────────────────────────────────────
+        # Strict 0.4 by default. Auto-relax (0.3 → 0.2 → 0.1 → 0.0) if the strict
+        # cut leaves us with too few memories. The threshold actually used is
+        # exposed via self._last_confidence_threshold so route() can record it
+        # in retrieval_meta — making it visible in review traces.
+        all_results, self._last_confidence_threshold = self._apply_confidence_filter(all_results)
 
         seen:   Set[str]                 = set()
         scored: List[Tuple[float, Dict]] = []

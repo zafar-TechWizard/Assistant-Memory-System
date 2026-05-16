@@ -1,0 +1,45 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+# SOFi Memory System — Dependencies
+# ═══════════════════════════════════════════════════════════════════════════════
+# Install: pip install -r memory/requirements.txt
+#
+# Post-install (one-time, downloads NLP models):
+#   python -m spacy download en_core_web_sm
+#   python -m coreferee install en
+#
+# Required environment variable for consolidation:
+#   export GROQ_API_KEY=your_key
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+# ── Long-Term Memory (Neo4j graph) ────────────────────────────────────────────
+neo4j>=5.15.0
+tenacity>=8.2.3              # connection retry with exponential backoff
+
+
+# ── Data Models ───────────────────────────────────────────────────────────────
+pydantic>=2.5.0              # node + edge schema validation (uses v1 compat layer)
+
+
+# ── Embeddings + Reranking (local, no API) ────────────────────────────────────
+sentence-transformers>=2.2.2 # MiniLM-L6-v2 (384-dim) + ms-marco cross-encoder
+numpy>=1.24.3                # required transitively by sentence-transformers
+
+
+# ── Entity Extraction Pipeline ────────────────────────────────────────────────
+spacy>=3.7.0                 # NER + noun-chunk extraction
+coreferee>=1.4.0             # pronoun resolution ("she", "him", "that")
+gliner>=0.2.0                # zero-shot NER for concept-level entities
+
+
+# ── Temporal Parsing ──────────────────────────────────────────────────────────
+dateparser>=1.2.0            # "last Tuesday", "two weeks ago" → datetime
+
+
+# ── Consolidation Pipeline (nightly LLM extraction) ───────────────────────────
+groq>=0.4.1                  # async Groq client for qwen3-32b extraction
+
+
+# ── Optional but recommended ──────────────────────────────────────────────────
+# Used by working_memory + consolidation for atomic writes and HTTP health checks.
+# Standard library covers most needs; nothing else required at the memory layer.
