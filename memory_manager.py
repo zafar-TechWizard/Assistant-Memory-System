@@ -134,6 +134,12 @@ class MemoryManager:
         )
         await self.retriever.ensure_fulltext_index()
 
+        # Prime Neo4j's query plan cache for every retrieval pattern.
+        # Without this, the first real user query pays a 200-500ms planning
+        # cost on top of execution. After warmup, all retrieval patterns
+        # use cached plans and land at steady-state latency.
+        await self.retriever.warmup()
+
         # 3. Memory Router
         self.router = MemoryRouter(engine=self.retriever)
 

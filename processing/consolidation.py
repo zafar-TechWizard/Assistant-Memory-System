@@ -360,10 +360,12 @@ class ContextFetcher:
 
     async def _fetch_recent_experiences(self) -> List[Dict[str, Any]]:
         """Recent ExperienceMemory nodes as temporal context."""
+        # Compute cutoff in Python so the timestamp index is usable.
+        cutoff_iso = (datetime.datetime.now() - datetime.timedelta(days=self.RECENT_DAYS)).isoformat()
         rows = await self.neo4j.execute_query(
             f"""
             MATCH (m:ExperienceMemory)
-            WHERE datetime(m.timestamp) > datetime() - duration({{days: {self.RECENT_DAYS}}})
+            WHERE m.timestamp > $cutoff_iso
               AND NOT coalesce(m.superseded, false)
             RETURN m.id AS id, m.content AS content,
                    m.timestamp AS timestamp,
@@ -374,7 +376,7 @@ class ContextFetcher:
             ORDER BY m.timestamp DESC
             LIMIT $limit
             """,
-            {"limit": self.RECENT_EXPERIENCE_LIMIT},
+            {"limit": self.RECENT_EXPERIENCE_LIMIT, "cutoff_iso": cutoff_iso},
         )
         return rows
 

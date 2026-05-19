@@ -279,6 +279,13 @@ class ConsolidationRunner:
         except Exception as exc:
             observer.warning("ensure_fulltext_index failed (non-fatal)", error=str(exc))
 
+        # Warm up the query plan cache so the first session's context fetch
+        # doesn't pay cold-start. Saves 200-500ms per consolidation run.
+        try:
+            await retrieval.warmup()
+        except Exception as exc:
+            observer.warning("retrieval warmup failed (non-fatal)", error=str(exc))
+
         agent = GeminiAgent(
             cli_path=self.gemini_cli_path,
             timeout_s=self.agent_timeout_s,
