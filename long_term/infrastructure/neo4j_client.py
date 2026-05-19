@@ -65,7 +65,11 @@ class Neo4jClient:
                 max_connection_lifetime=self.config.max_connection_lifetime,
                 max_connection_pool_size=self.config.max_connection_pool_size,
                 connection_acquisition_timeout=self.config.connection_acquisition_timeout,
-                max_transaction_retry_time=self.config.max_transaction_retry_time
+                max_transaction_retry_time=self.config.max_transaction_retry_time,
+                # Suppress UNRECOGNIZED-edge-type and missing-property notifications.
+                # Our queries reference all 23 typed edges even when the graph only
+                # has a subset — Neo4j warns about the absent types. Cosmetic noise.
+                notifications_min_severity="OFF",
             )
             
             # Test connection

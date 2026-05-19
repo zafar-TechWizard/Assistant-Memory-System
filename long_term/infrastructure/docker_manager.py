@@ -4,22 +4,33 @@ import time
 from pathlib import Path
 from typing import Dict, Any, Optional
 
+from memory.config import config as _mem_cfg
 from memory.observability import observer
 
-# SOFI Neo4j Configuration
-SOFI_NEO4J_CONFIG = {
-    "container_name": "sofi-neo4j-memory",
-    "database": "neo4j",
-    "username": "neo4j",
-    "password": "SofiAiAssistant",
-    "data_path": r"C:\Users\mdzaf\OneDrive\Desktop\assistant\BRAIN\MEMORY",
-    "uri": "bolt://localhost:7687",
-    "http_port": 7474,
-    "bolt_port": 7687,
-    "health_check_max_attempts": 12,
-    "health_check_interval": 5,  # seconds
-    "post_start_wait": 10  # seconds to wait after "Started" message
-}
+
+def _build_default_neo4j_config() -> Dict[str, Any]:
+    """
+    Build the default Neo4j Docker config from the central memory config.
+    The data_path is resolved at runtime to <project>/BRAIN/memory/data/neo4j/
+    so that all SOFi state lives under BRAIN/memory/ as a single root.
+    """
+    return {
+        "container_name": _mem_cfg.container_name,
+        "database":       _mem_cfg.database,
+        "username":       _mem_cfg.neo4j_username,
+        "password":       _mem_cfg.neo4j_password,
+        "data_path":      _mem_cfg.neo4j_data_path,
+        "uri":            _mem_cfg.neo4j_uri,
+        "http_port":      _mem_cfg.neo4j_http_port,
+        "bolt_port":      _mem_cfg.neo4j_bolt_port,
+        "health_check_max_attempts": _mem_cfg.neo4j_health_check_max_attempts,
+        "health_check_interval":     _mem_cfg.neo4j_health_check_interval,
+        "post_start_wait":           _mem_cfg.neo4j_post_start_wait,
+    }
+
+
+# SOFI Neo4j Configuration — derived from memory config at import time
+SOFI_NEO4J_CONFIG = _build_default_neo4j_config()
 
 
 class DockerManager:

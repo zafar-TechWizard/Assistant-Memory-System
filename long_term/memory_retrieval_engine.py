@@ -288,7 +288,7 @@ class MemoryRetrievalEngine:
         query = f"""
         CALL db.index.fulltext.queryNodes("memory_fts", $query_string)
         YIELD node, score
-        WHERE {_NOT_SUPERSEDED_node.lstrip("AND ")}
+        WHERE {_NOT_SUPERSEDED_node[4:]}
         RETURN
             node.id            AS id,
             node.content       AS content,
@@ -821,7 +821,7 @@ class MemoryRetrievalEngine:
         
         query = f"""
         MATCH (m)
-        WHERE m.timestamp > datetime() - duration({{days: $cutoff_days}})
+        WHERE datetime(m.timestamp) > datetime() - duration({{days: $cutoff_days}})
         {_NOT_SUPERSEDED_m}
         {topic_filter}
         RETURN
@@ -1015,7 +1015,7 @@ class MemoryRetrievalEngine:
 
         query = f"""
         MATCH (m)
-        WHERE m.timestamp >= datetime() - duration({{days: $days}})
+        WHERE datetime(m.timestamp) >= datetime() - duration({{days: $days}})
           AND abs(coalesce(m.emotional_tone, 0.0)) >= $min_emotion
         {_NOT_SUPERSEDED_m}
         {topic_filter}

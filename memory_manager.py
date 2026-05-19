@@ -19,8 +19,8 @@ Usage:
     await manager.shutdown()
 
 Observability:
-    log=True    → diagnostic events to memory/data/logs/YYYY-MM-DD.log
-    review=True → per-query traces to memory/data/reviews/observe/YYYY-MM-DD/
+    log=True    → diagnostic events to BRAIN/memory/data/logs/YYYY-MM-DD.log
+    review=True → per-query traces to BRAIN/memory/data/reviews/observe/YYYY-MM-DD/
 """
 
 import asyncio
@@ -52,11 +52,11 @@ class MemoryManager:
     def __init__(self, log: bool = False, review: bool = False):
         """
         Args:
-            log:    if True, diagnostic events are written to memory/data/logs/.
+            log:    if True, diagnostic events are written to BRAIN/memory/data/logs/.
                     Use for debugging errors and verifying operation.
             review: if True, every observe() call writes a full pipeline trace
-                    to memory/data/reviews/observe/. Use for behavioural analysis
-                    and improving retrieval quality.
+                    to BRAIN/memory/data/reviews/observe/. Use for behavioural
+                    analysis and improving retrieval quality.
         """
         self.config = config
         self.is_initialized: bool = False
@@ -81,14 +81,19 @@ class MemoryManager:
         Boot sequence — must be awaited once before any other call.
 
         Steps:
-          0. Start Docker container for Neo4j (idempotent)
-          1. Connect Neo4j and create schema (indexes + constraints)
-          2. Build embedding utility and retrieval engine
-          3. Build working memory, wired to the retrieval engine
+          0. Ensure all operational directories exist (BRAIN/memory/data/...)
+          1. Start Docker container for Neo4j (idempotent)
+          2. Connect Neo4j and create schema (indexes + constraints)
+          3. Build embedding utility and retrieval engine
+          4. Build working memory, wired to the retrieval engine
         """
         observer.info("MemoryManager.setup starting")
 
-        # 0. Docker / Neo4j health
+        # 0. Ensure operational directories exist before anything else
+        dirs = self.config.ensure_directories()
+        observer.info("directories ensured", **{k: str(v) for k, v in dirs.items()})
+
+        # 1. Docker / Neo4j health
         self.docker_manager = DockerManager()
         try:
             self.docker_manager.start_docker()

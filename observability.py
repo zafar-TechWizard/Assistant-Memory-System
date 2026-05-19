@@ -190,12 +190,15 @@ class Observer:
         Called once by MemoryManager.setup. Idempotent — safe to call again.
 
         Args:
-            log:      enable diagnostic logging to memory/data/logs/YYYY-MM-DD.log
-            review:   enable per-query traces to memory/data/reviews/observe/YYYY-MM-DD/
-            data_dir: override base directory (defaults to memory/data)
+            log:      enable diagnostic logging to <BRAIN/memory/data>/logs/YYYY-MM-DD.log
+            review:   enable per-query traces to <BRAIN/memory/data>/reviews/observe/YYYY-MM-DD/
+            data_dir: override base data directory. If None, uses memory config:
+                      <project>/BRAIN/memory/data/
         """
         if data_dir is None:
-            data_dir = Path(__file__).parent / "data"
+            # Resolve at call-time from central config so we always land at BRAIN/memory/data
+            from memory.config import config as _mem_cfg
+            data_dir = _mem_cfg.data_dir
 
         if log and self._log_writer is None:
             self._log_writer = _LogWriter(data_dir / "logs")

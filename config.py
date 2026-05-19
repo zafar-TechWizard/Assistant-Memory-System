@@ -16,6 +16,7 @@ Or via the factory function (backward-compatible with consolidation.py):
 
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Dict
 
 
 @dataclass
@@ -73,36 +74,110 @@ class MemoryConfig:
     session_timeout_minutes: int = 30
 
     # -------------------------------------------------------------------------
-    # Derived Paths  (computed from the memory/ package directory)
+    # Derived Paths
+    #
+    # CODE lives at:    <project>/memory/                  (this file's directory)
+    # DATA lives at:    <project>/BRAIN/memory/data/       (operational state)
+    #
+    # All runtime artifacts (Neo4j graph files, conversation log, working
+    # context, logs, review traces, dry-run plans) live under BRAIN/memory/
+    # so the brain layer owns operational state cleanly while the code stays
+    # in its own package.
     # -------------------------------------------------------------------------
     @property
     def _memory_root(self) -> Path:
-        """Absolute path to the memory/ package directory."""
+        """Absolute path to the memory/ source-code package directory."""
         return Path(__file__).parent
 
     @property
+    def _project_root(self) -> Path:
+        """Absolute path to the project root (parent of memory/)."""
+        return self._memory_root.parent
+
+    @property
+    def brain_dir(self) -> Path:
+        """
+        Absolute path to <project>/BRAIN/memory/.
+        All operational runtime data lives under this directory.
+        """
+        p = self._project_root / "BRAIN" / "memory"
+        p.mkdir(parents=True, exist_ok=True)
+        return p
+
+    @property
     def data_dir(self) -> Path:
-        """Absolute path to memory/data/ — created on first access."""
-        p = self._memory_root / "data"
+        """<project>/BRAIN/memory/data/ — created on first access."""
+        p = self.brain_dir / "data"
         p.mkdir(parents=True, exist_ok=True)
         return p
 
     @property
     def conversation_log_path(self) -> Path:
+        """<project>/BRAIN/memory/data/conversation.json"""
         return self.data_dir / "conversation.json"
 
     @property
     def context_file_path(self) -> Path:
+        """<project>/BRAIN/memory/data/working_context.json"""
         return self.data_dir / "working_context.json"
 
     @property
     def neo4j_data_path(self) -> str:
-        return str(self.data_dir / "neo4j_production")
+        """
+        <project>/BRAIN/memory/data/neo4j/ — Docker mounts this as /data
+        inside the Neo4j container. Contains databases/, transactions/, dbms/.
+        """
+        p = self.data_dir / "neo4j"
+        p.mkdir(parents=True, exist_ok=True)
+        return str(p)
 
-    # Keep `base_path` for legacy code that reads config.get("base_path")
+    @property
+    def logs_dir(self) -> Path:
+        """<project>/BRAIN/memory/data/logs/ — observer log files."""
+        p = self.data_dir / "logs"
+        p.mkdir(parents=True, exist_ok=True)
+        return p
+
+    @property
+    def reviews_dir(self) -> Path:
+        """<project>/BRAIN/memory/data/reviews/ — observer review traces."""
+        p = self.data_dir / "reviews"
+        p.mkdir(parents=True, exist_ok=True)
+        return p
+
+    @property
+    def consolidation_dry_runs_dir(self) -> Path:
+        """<project>/BRAIN/memory/data/consolidation_dry_runs/ — agent plan dumps."""
+        p = self.data_dir / "consolidation_dry_runs"
+        p.mkdir(parents=True, exist_ok=True)
+        return p
+
+    # Legacy alias kept for backward compatibility
     @property
     def base_path(self) -> str:
-        return str(self._memory_root.parent)
+        return str(self._project_root)
+
+    # -------------------------------------------------------------------------
+    # Setup
+    # -------------------------------------------------------------------------
+    def ensure_directories(self) -> Dict[str, "Path"]:
+        """
+        Ensure every operational directory exists on disk. Called explicitly
+        at startup so missing directories surface immediately rather than
+        deep inside a writer that assumes its target exists.
+
+        Returns a dict mapping logical names → resolved paths. Useful for
+        confirming exactly what got created (the runner prints this).
+        """
+        # Accessing each property triggers its own mkdir(parents=True, exist_ok=True)
+        return {
+            "brain_dir":                  self.brain_dir,
+            "data_dir":                   self.data_dir,
+            "neo4j_data_path":            Path(self.neo4j_data_path),
+            "logs_dir":                   self.logs_dir,
+            "reviews_dir":                self.reviews_dir,
+            "consolidation_dry_runs_dir": self.consolidation_dry_runs_dir,
+        }
 
 
 # ---------------------------------------------------------------------------

@@ -11,7 +11,9 @@ Architecture Overview
 Retrieval Cascade (per message)
 =================================
   Phase A  [PARALLEL via asyncio.gather]:
-    Tier 1 — Primary dispatch (intent-routed, e.g. semantic_search for FACTUAL)
+    Tier 1 — Primary dispatch (intent-routed: bm25_search / spreading_activation /
+             emotional / temporal). Semantic search is NOT used on the hot path —
+             embeddings stay at consolidation-time only.
     Tier 2 — Budget-fill (runs CONCURRENTLY with Tier 1, not after it)
 
   Phase B  [SEQUENTIAL, only if needed]:
@@ -33,7 +35,7 @@ Latency budget:
    TOTAL:   50-120ms  ← safe inside 300ms budget
 
 All methods on MemoryRetrievalEngine are used — mapped to tiers:
-  Tier 1  : get_memories_with_connected_nodes, semantic_search,
+  Tier 1  : get_memories_with_connected_nodes, bm25_search,
             get_emotionally_significant_memories, get_recent_memories,
             get_memories_by_time_range
   Tier 2  : get_memories_with_weighted_relevance, get_memories_by_topic,
@@ -242,14 +244,15 @@ def has_temporal_signal(text: str) -> bool:
 
 # Pre-compiled at import time — zero runtime compilation overhead
 _ENTITY_PHRASE_RE = re.compile(
-    r'\b(who is|tell me about|what do you know about|remind me about|'
+    r'\b(who is|tell me about|what do (you|i) know about|remind me about|'
     r'do you remember|what happened (with|to)|describe|explain|'
-    r'talk to me about|what can you tell me)\b',
+    r'talk to me about|what can you tell me|have i (told|mentioned)|'
+    r'did i (say|tell|mention))\b',
     re.IGNORECASE,
 )
 _QUESTION_RE = re.compile(
-    r'\b(what (was|is|were|happened)|where (is|was|did)|when did|'
-    r'which|how did|how (was|were)|why did)\b',
+    r'\b(what (was|is|were|happened|do|did|can)|where (is|was|did)|'
+    r'when (did|was|is)|which|how (did|do|was|were|to|can)|why (did|do|am|is))\b',
     re.IGNORECASE,
 )
 _EMOTION_RE = re.compile(
@@ -364,6 +367,14 @@ class IntentClassifier:
     ) -> IntentResult:
         winner = max(scores, key=lambda k: scores[k])
         winner_score = scores[winner]
+
+        # If NO signal fired anywhere, default to AMBIENT (safe bypass) rather
+        # than letting dict-ordering pick ENTITY arbitrarily. Prevents the
+        # "Bobby" / "what do I know about X" → entity with confidence 0 case.
+        if winner_score <= 0.0:
+            winner = Intent.AMBIENT
+            winner_score = 0.3
+            signals.append("no_signals_default_ambient")
 
         # Secondary intents that also fired above the co-fire threshold
         co_intents = [
@@ -658,20 +669,16 @@ class MemoryRouter:
             return self._tag_tier_hints(results)
 
         if intent == Intent.FACTUAL:
+            # Semantic search is intentionally NOT used on the hot path —
+            # embedding compute stays at consolidation time only. BM25 covers
+            # this intent at zero embedding cost. The content_vector field is
+            # still populated on every node for offline analysis later.
             if entities:
-                # BM25 (lexical) + semantic (vector) run concurrently
-                bm25_res, sem_res = await asyncio.gather(
-                    eng.bm25_search(query_terms=entities, limit=half),
-                    eng.semantic_search(query_text=message, top_k=half),
-                    return_exceptions=True,
-                )
-                merged: List[Dict] = []
-                if not isinstance(bm25_res, Exception):
-                    merged.extend(bm25_res)
-                if not isinstance(sem_res, Exception):
-                    merged.extend(sem_res)
-                return merged
-            return await eng.semantic_search(query_text=message, top_k=budget)
+                return await eng.bm25_search(query_terms=entities, limit=budget)
+            # No entities + no semantic fallback. Coverage check + Tier 2 may
+            # still find something. If real usage shows this gap matters, add
+            # a keyword-based BM25 fallback then — with actual failure cases.
+            return []
 
         if intent == Intent.EMOTIONAL:
             # Two concurrent queries — mirrors human recency primacy:

@@ -1,55 +1,69 @@
 """
-SOFi Memory Consolidation — 5-Stage Pipeline
+SOFi Memory Consolidation -- Agentic Pipeline via Gemini CLI
 
-Extract → Match → Resolve → Write → Link
+One reasoning pass per session. The Gemini CLI agent reads the conversation,
+sees pre-fetched relevant memories from the graph, and produces a complete
+consolidation plan: what to create, update, enhance, skip, or supersede.
+Python deterministically executes the plan against Neo4j.
 
-Design principles (research-backed):
-- Single canonical node per person (Graphiti/Zep approach) — MERGE on person_name
-- Single canonical node per concept — MERGE on concept
+Architecture:
+    ContextFetcher   ->  fetches existing memories likely relevant to session
+    GeminiAgent      ->  invokes gemini CLI, parses plan from output
+    PlanExecutor     ->  applies the plan: writes nodes, creates edges
+    AgenticEngine    ->  orchestrates the above per session
+
+Pre-fetching means the agent doesn't need graph access during reasoning -- all
+relevant existing memories are inlined into the prompt. The agent then reasons
+step-by-step internally and emits the plan as structured JSON.
+
+Design principles preserved from prior version:
+- Single canonical node per person (MERGE on person_name)
+- Single canonical node per concept (MERGE on concept)
 - Operations: CREATE | UPDATE | ENHANCE | SKIP | CONTRADICT
-- Never physically delete — CONTRADICT preserves temporal lineage
-- Edge deduplication: MERGE on (from, to, type) — strengthen if exists
-- LLM called at most twice per session (extract + resolve conflicts)
-- Partial failure isolation — one bad memory doesn't abort the session
-- Idempotent writes — safe to re-run on same session (crash recovery)
+- Never physically delete -- CONTRADICT preserves temporal lineage
+- Edge dedup via MERGE (from, to, type)
+- Per-node error isolation
+- Idempotent writes
 """
 
 import asyncio
 import datetime
+import difflib
 import json
 import os
+import re
+import shutil
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-
-from groq import AsyncGroq
+from uuid import uuid4
 
 from memory.config import get_config
 from memory.long_term.infrastructure.neo4j_client import Neo4jClient, create_neo4j_client
+from memory.long_term.memory_retrieval_engine import MemoryRetrievalEngine
 from memory.long_term.models.node_models import (
     ExperienceMemoryNode,
     KnowledgeMemoryNode,
     RelationshipMemoryNode,
-    MemoryContext,
 )
 from memory.long_term.models.relationship_models import MemoryRelationshipType
-from memory.processing.embedding_utils import EmbeddingUtils
-from memory.long_term.memory_retrieval_engine import MemoryRetrievalEngine
-
 from memory.observability import observer
+from memory.processing.embedding_utils import EmbeddingUtils
+from memory.processing.entity_extractor import EntityExtractor
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# ===============================================================================
 # DATA CONTRACTS
-# ═══════════════════════════════════════════════════════════════════════════════
+# ===============================================================================
 
 @dataclass
 class ExtractedMemory:
-    index: int
-    type: str                               # EXPERIENCE | KNOWLEDGE | RELATIONSHIP
+    """A memory the agent extracted from the conversation."""
+    op_index: int                          # position in the operations list
+    type: str                              # EXPERIENCE | KNOWLEDGE | RELATIONSHIP
     content: str
     importance: float
-
     tags: List[str] = field(default_factory=list)
 
     # EXPERIENCE
@@ -75,863 +89,1425 @@ class ExtractedMemory:
 
 
 @dataclass
-class ExtractedEdge:
-    from_index: int
-    to_index: int
-    rel_type: str
+class PlanOperation:
+    """One operation from the agent's plan."""
+    op_index: int
+    operation: str                          # CREATE | UPDATE | ENHANCE | SKIP | CONTRADICT
+    reason: str = ""
+
+    # For CREATE / CONTRADICT -- full memory dict
+    memory: Optional[ExtractedMemory] = None
+
+    # For UPDATE / ENHANCE / SKIP / CONTRADICT -- existing node id
+    target_id: Optional[str] = None
+
+    # For UPDATE -- specific field changes
+    update_fields: Dict[str, Any] = field(default_factory=dict)
+
+    # For ENHANCE -- list field appends
+    enhance_additions: Dict[str, List[Any]] = field(default_factory=dict)
+
+
+@dataclass
+class PlanEdge:
+    """An edge specification from the plan."""
+    # Either op_index (new node) or node_id (existing node) for each end
+    from_op_index: Optional[int] = None
+    from_node_id: Optional[str] = None
+    to_op_index: Optional[int] = None
+    to_node_id: Optional[str] = None
+    rel_type: str = "ASSOCIATED_WITH"
     strength: float = 0.7
     bidirectional: bool = False
 
 
 @dataclass
-class ExtractionResult:
-    memories: List[ExtractedMemory]
-    edges: List[ExtractedEdge]
+class ConsolidationPlan:
+    """The agent's full plan for one session."""
+    session_id: str
+    reasoning: str = ""
+    session_summary: str = ""
     overall_sentiment: float = 0.0
-
-
-@dataclass
-class ExistingMatch:
-    node_id: str
-    label: str
-    content: str
-    key_fields: Dict[str, Any]
-    similarity: float
-
-
-@dataclass
-class MatchedMemory:
-    extracted: ExtractedMemory
-    matches: List[ExistingMatch]
-
-
-@dataclass
-class OperationPlan:
-    extracted: ExtractedMemory
-    operation: str                          # CREATE | UPDATE | ENHANCE | SKIP | CONTRADICT
-    target_id: Optional[str] = None
-    update_fields: Dict[str, Any] = field(default_factory=dict)
-    reason: str = ""
+    operations: List[PlanOperation] = field(default_factory=list)
+    edges: List[PlanEdge] = field(default_factory=list)
 
 
 @dataclass
 class SavedNode:
-    extracted_index: int
+    """Result of an executed operation."""
+    op_index: int
     neo4j_id: str
     label: str
     operation: str
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# GROQ CLIENT
-# ═══════════════════════════════════════════════════════════════════════════════
+@dataclass
+class SessionResult:
+    """Per-session outcome for diagnostics."""
+    session_id: str
+    turns: int
+    succeeded: bool = False
+    operations_planned: int = 0
+    nodes_created: int = 0
+    nodes_updated: int = 0
+    nodes_enhanced: int = 0
+    nodes_skipped: int = 0
+    nodes_superseded: int = 0
+    edges_created: int = 0
+    reasoning: str = ""
+    summary: str = ""
+    error: Optional[str] = None
 
-class GroqClient:
-    MODELS = {
-        "smart": {
-            "name": "qwen/qwen3-32b",
-            "tpm": 30_000,
-            "max_output": 4000,
-        },
-    }
 
-    def __init__(self, api_key: Optional[str] = None):
-        self.api_key = api_key or os.environ.get("GROQ_API_KEY", "")
-        if not self.api_key:
-            raise ValueError("GROQ_API_KEY not set. Export it as an environment variable.")
-        self.client = AsyncGroq(api_key=self.api_key)
-        self._usage: Dict[str, int] = {k: 0 for k in self.MODELS}
-        self._reset_at = datetime.datetime.now()
+# ===============================================================================
+# CONTEXT FETCHER
+# Pre-fetches existing memories likely relevant to this session.
+# ===============================================================================
 
-    async def call(
-        self,
-        tier: str,
-        system: str,
-        user: str,
-        json_mode: bool = True,
-        estimated_tokens: int = 2000,
-    ) -> Optional[str]:
-        await self._maybe_wait(tier, estimated_tokens)
-        model = self.MODELS[tier]["name"]
-        kwargs: Dict[str, Any] = {
-            "model": model,
-            "messages": [
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-            "temperature": 0.1,
-            "max_tokens": self.MODELS[tier]["max_output"],
-        }
-        if json_mode:
-            kwargs["response_format"] = {"type": "json_object"}
+class ContextFetcher:
+    """
+    Queries Neo4j for memories the agent should consider when consolidating
+    this session. The agent uses this pre-fetched context to decide
+    UPDATE/ENHANCE/CONTRADICT/SKIP without needing graph access at reason-time.
+
+    Strategy:
+    - Extract entities + topical keywords from the conversation
+    - Fetch RelationshipMemory for each named person
+    - BM25 search across conversation text -> top similar memories
+    - Recent ExperienceMemory (last 7 days) as temporal context
+
+    Budget: ~50-80 candidate memories total. Enough context, not overwhelming.
+    """
+
+    RECENT_DAYS = 7
+    BM25_LIMIT = 25
+    RECENT_EXPERIENCE_LIMIT = 15
+    PERSON_FUZZY_RATIO = 0.85
+
+    def __init__(self, neo4j: Neo4jClient, retrieval: Optional[MemoryRetrievalEngine] = None):
+        self.neo4j = neo4j
+        self.retrieval = retrieval
+        # Entity extractor used to quickly identify people/topics in the conversation.
+        # Use heuristic-only mode here (don't load heavy models for context fetching).
+        self.entity_extractor = EntityExtractor(strict_spacy=False, use_gliner=False, use_coreferee=False)
+
+    async def fetch(self, conversations: List[Dict[str, str]]) -> Dict[str, Any]:
+        """
+        Returns a context dict the agent can consume:
+            {
+                "people_known":         [ {id, person_name, ...}, ... ],
+                "concepts_known":       [ {id, concept, definition, ...}, ... ],
+                "similar_memories":     [ {id, content, type, score, ...}, ... ],
+                "recent_experiences":   [ {id, content, timestamp, ...}, ... ],
+            }
+        """
+        conv_text = self._format_conversation(conversations)
+        if not conv_text.strip():
+            return self._empty_context()
+
+        # Extract entity/keyword hints
+        entities = list(set(self.entity_extractor.extract_entities(conv_text)))
+        people_candidates = [e for e in entities if e and e[0].isalpha()]
+
+        # Run all fetches concurrently
         try:
-            resp = await self.client.chat.completions.create(**kwargs)
-            self._usage[tier] += estimated_tokens
-            return resp.choices[0].message.content
+            people_task = self._fetch_people(people_candidates)
+            similar_task = self._fetch_similar(entities, conv_text)
+            recent_task = self._fetch_recent_experiences()
+            concepts_task = self._fetch_known_concepts(entities)
+
+            people, similar, recent, concepts = await asyncio.gather(
+                people_task, similar_task, recent_task, concepts_task,
+                return_exceptions=True,
+            )
         except Exception as exc:
-            observer.error(f"[groq] {tier} call failed: {exc}")
-            return None
+            observer.error("context fetch failed", exception=exc)
+            return self._empty_context()
 
-    async def _maybe_wait(self, tier: str, tokens: int) -> None:
-        now = datetime.datetime.now()
-        if (now - self._reset_at).total_seconds() >= 60:
-            self._usage = {k: 0 for k in self.MODELS}
-            self._reset_at = now
-        if self._usage.get(tier, 0) + tokens > self.MODELS[tier]["tpm"]:
-            wait = 60 - (now - self._reset_at).total_seconds()
-            await asyncio.sleep(max(wait, 0))
-            self._usage = {k: 0 for k in self.MODELS}
-            self._reset_at = datetime.datetime.now()
+        return {
+            "people_known":       people if not isinstance(people, Exception) else [],
+            "concepts_known":     concepts if not isinstance(concepts, Exception) else [],
+            "similar_memories":   similar if not isinstance(similar, Exception) else [],
+            "recent_experiences": recent if not isinstance(recent, Exception) else [],
+        }
+
+    def _format_conversation(self, conversations: List[Dict[str, str]]) -> str:
+        return " ".join(
+            str(m.get("content", "")) for m in conversations if m.get("content")
+        )
+
+    @staticmethod
+    def _empty_context() -> Dict[str, Any]:
+        return {
+            "people_known": [],
+            "concepts_known": [],
+            "similar_memories": [],
+            "recent_experiences": [],
+        }
+
+    async def _fetch_people(self, candidates: List[str]) -> List[Dict[str, Any]]:
+        """For each candidate person name, find their canonical RelationshipMemory if any."""
+        if not candidates:
+            return []
+
+        # Exact case-insensitive match first
+        rows = await self.neo4j.execute_query(
+            """
+            MATCH (n:RelationshipMemory)
+            WHERE NOT coalesce(n.superseded, false)
+              AND any(c IN $candidates WHERE toLower(c) = toLower(n.person_name))
+            RETURN n.id AS id, n.person_name AS person_name,
+                   n.relationship_type AS relationship_type,
+                   n.emotional_connection AS emotional_connection,
+                   n.trust_level AS trust_level,
+                   n.personality_traits AS personality_traits,
+                   n.interests AS interests,
+                   n.content AS content,
+                   n.importance_score AS importance_score
+            LIMIT 50
+            """,
+            {"candidates": candidates},
+        )
+
+        matched_lower = {str(r.get("person_name", "")).lower() for r in rows}
+        unmatched = [c for c in candidates if c.lower() not in matched_lower]
+
+        if unmatched:
+            all_people = await self.neo4j.execute_query(
+                """
+                MATCH (n:RelationshipMemory)
+                WHERE NOT coalesce(n.superseded, false)
+                RETURN n.id AS id, n.person_name AS person_name,
+                       n.relationship_type AS relationship_type,
+                       n.emotional_connection AS emotional_connection,
+                       n.trust_level AS trust_level,
+                       n.personality_traits AS personality_traits,
+                       n.interests AS interests,
+                       n.content AS content,
+                       n.importance_score AS importance_score
+                LIMIT 300
+                """,
+                {},
+            )
+            for cand in unmatched:
+                cand_l = cand.lower()
+                for r in all_people:
+                    existing = str(r.get("person_name", "")).lower()
+                    if not existing:
+                        continue
+                    if existing.startswith(cand_l) or cand_l.startswith(existing):
+                        rows.append(r)
+                        break
+                    if difflib.SequenceMatcher(None, cand_l, existing).ratio() >= self.PERSON_FUZZY_RATIO:
+                        rows.append(r)
+                        break
+
+        # Dedupe by id
+        seen = set()
+        deduped = []
+        for r in rows:
+            rid = r.get("id")
+            if rid and rid not in seen:
+                seen.add(rid)
+                deduped.append(r)
+        return deduped
+
+    async def _fetch_similar(
+        self, entities: List[str], conv_text: str,
+    ) -> List[Dict[str, Any]]:
+        """BM25 search across all memory types for content most similar to conversation."""
+        if self.retrieval is not None and entities:
+            try:
+                return await self.retrieval.bm25_search(
+                    query_terms=entities[:10], limit=self.BM25_LIMIT,
+                )
+            except Exception as exc:
+                observer.warning("retrieval bm25 failed during prefetch", error=str(exc))
+
+        if not entities:
+            return []
+
+        # Fallback: query Neo4j fulltext index directly
+        query_string = " OR ".join(self._escape_lucene(e) for e in entities[:10])
+        try:
+            rows = await self.neo4j.execute_query(
+                """
+                CALL db.index.fulltext.queryNodes("memory_fts", $q)
+                YIELD node, score
+                WHERE NOT coalesce(node.superseded, false)
+                RETURN node.id AS id, node.content AS content,
+                       labels(node)[0] AS label,
+                       node.timestamp AS timestamp,
+                       node.emotional_tone AS emotional_tone,
+                       node.participants AS participants,
+                       node.concept AS concept,
+                       node.person_name AS person_name,
+                       node.importance_score AS importance_score,
+                       score AS bm25_score
+                ORDER BY score DESC LIMIT $limit
+                """,
+                {"q": query_string, "limit": self.BM25_LIMIT},
+            )
+            return rows
+        except Exception as exc:
+            observer.warning("fulltext fallback failed", error=str(exc))
+            return []
+
+    @staticmethod
+    def _escape_lucene(s: str) -> str:
+        """Escape Lucene special chars in entity strings."""
+        return re.sub(r'([+\-!(){}\[\]^"~*?:\\/&|])', r'\\\1', s)
+
+    async def _fetch_recent_experiences(self) -> List[Dict[str, Any]]:
+        """Recent ExperienceMemory nodes as temporal context."""
+        rows = await self.neo4j.execute_query(
+            f"""
+            MATCH (m:ExperienceMemory)
+            WHERE datetime(m.timestamp) > datetime() - duration({{days: {self.RECENT_DAYS}}})
+              AND NOT coalesce(m.superseded, false)
+            RETURN m.id AS id, m.content AS content,
+                   m.timestamp AS timestamp,
+                   m.emotional_tone AS emotional_tone,
+                   m.event_type AS event_type,
+                   m.participants AS participants,
+                   m.importance_score AS importance_score
+            ORDER BY m.timestamp DESC
+            LIMIT $limit
+            """,
+            {"limit": self.RECENT_EXPERIENCE_LIMIT},
+        )
+        return rows
+
+    async def _fetch_known_concepts(self, entities: List[str]) -> List[Dict[str, Any]]:
+        """KnowledgeMemory nodes matching any extracted keyword."""
+        if not entities:
+            return []
+        rows = await self.neo4j.execute_query(
+            """
+            MATCH (n:KnowledgeMemory)
+            WHERE NOT coalesce(n.superseded, false)
+              AND any(c IN $candidates WHERE
+                  toLower(n.concept) CONTAINS toLower(c)
+                  OR toLower(c) CONTAINS toLower(n.concept))
+            RETURN n.id AS id, n.concept AS concept,
+                   n.definition AS definition,
+                   n.category AS category,
+                   n.content AS content,
+                   n.importance_score AS importance_score
+            LIMIT 30
+            """,
+            {"candidates": entities[:15]},
+        )
+        return rows
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# STAGE 1 — CONVERSATION ANALYZER
-# ═══════════════════════════════════════════════════════════════════════════════
+# ===============================================================================
+# GEMINI AGENT
+# Builds the agent prompt, invokes gemini CLI, parses the plan.
+# ===============================================================================
 
-_EXTRACTION_SYSTEM = """You are a memory extraction engine for a personal AI assistant named SOFi.
-Your job: read a conversation and extract what is genuinely worth storing as long-term memory.
+_AGENT_SYSTEM_INSTRUCTION = """You are SOFi's memory consolidation agent.
 
-MEMORY TYPES:
+Your task: read a conversation, see what's already in SOFi's long-term memory
+graph, and produce a precise plan for what to add, update, enhance, skip, or
+supersede.
 
-EXPERIENCE — A specific event, interaction, or episode that happened.
-  Required fields: event_type, participants, emotional_tone, timestamp
-  event_type: one of [conversation, meeting, activity, learning, work, social, problem_solving, conflict, celebration, other]
-  emotional_tone: -1.0 (very negative) to +1.0 (very positive)
-  participants: list of people involved by name
+# YOUR REASONING PROCESS (think step-by-step internally)
 
-KNOWLEDGE — A fact, concept, insight, or skill worth retaining.
-  Required fields: concept, definition, category
-  category: one of [technology, work, health, finance, education, social, personal, other]
+STEP 1 -- FILTER NOISE.
+Real conversations are messy. They mix substance with chitchat, sarcasm,
+hypotheticals, fillers. Identify what's worth memorizing.
 
-RELATIONSHIP — Information about a specific person.
-  Required fields: person_name, relationship_type, emotional_connection
-  relationship_type: one of [friend, family, colleague, mentor, acquaintance, romantic, other]
-  emotional_connection: -1.0 to +1.0
-  trust_level: 0.0 to 1.0
+KEEP (signal):
+- Specific people mentioned with substance (not just names dropped)
+- Events with consequences or emotional weight
+- Decisions, goals, commitments, plans
+- Personal facts the user shared (work, health, relationships, preferences)
+- Insights or realizations
+- Patterns mentioned multiple times in the conversation
+- Strong emotional states with clear causes
 
-WHAT TO STORE (importance >= 0.4):
-  - Specific people mentioned with meaningful context
-  - Events with lasting significance: conflicts, decisions, achievements, failures
-  - Facts or skills useful to recall later
-  - Emotional states with clear causes
-  - Commitments, goals, recurring patterns
+SKIP (noise):
+- Greetings, fillers, "ok", "yeah", "thanks"
+- Pure Q&A about external facts (weather, time, news)
+- Sarcasm or jokes -- don't take literally
+- Hypotheticals explicitly framed as such
+- Speculation about others' states without evidence
+- Anything that won't matter tomorrow
 
-WHAT TO SKIP (importance < 0.4):
-  - Small talk, greetings, filler
-  - Rhetorical questions
-  - Trivial logistics that expire immediately
+STEP 2 -- EXTRACT TYPED MEMORIES.
+For each piece of signal, draft a memory of one of three types:
 
-EDGE TYPES (relationships between extracted memories, choose from):
-  EXPERIENCE_CHAIN, EXPERIENCE_TO_KNOWLEDGE, EXPERIENCE_TO_RELATIONSHIP,
-  RELATIONSHIP_TO_EXPERIENCE, KNOWLEDGE_HIERARCHY, CAUSED, RESULTED_IN,
-  TRIGGERED, INFLUENCED, HAPPENED_BEFORE, HAPPENED_AFTER, CONCURRENT, SIMILAR_TO
+EXPERIENCE -- A specific event/interaction/episode.
+  Required: event_type, participants, emotional_tone, timestamp
+  event_type: conversation | meeting | activity | learning | work | social |
+              problem_solving | conflict | celebration | milestone | other
+  emotional_tone: -1.0 to +1.0
 
-Output ONLY valid JSON. No commentary, no markdown."""
+KNOWLEDGE -- A fact, concept, insight, or skill worth retaining.
+  Required: concept, definition, category
+  category: technology | work | health | finance | education | social |
+            personal | relationship | philosophy | other
+  Personal facts about the user are KNOWLEDGE.
 
-_EXTRACTION_USER = """Analyze this conversation. Extract memories worth storing long-term.
+RELATIONSHIP -- Information about a specific person.
+  Required: person_name, relationship_type, emotional_connection
+  relationship_type: friend | family | colleague | mentor | acquaintance |
+                     romantic | partner | parent | sibling | child | other
+  Include personality_traits and interests when revealed.
 
-USER: {user_id}
-DATE: {session_date}
+CROSS-CREATION RULE: When extracting an EXPERIENCE that involves a person
+with substance about them, ALSO create a RELATIONSHIP memory for that person.
+This guarantees the person has a canonical node for future cross-referencing.
 
-CONVERSATION:
-{conversation_text}
+STEP 3 -- MATCH AGAINST EXISTING CONTEXT.
+You will receive `existing_context` with:
+- `people_known`     -- RelationshipMemory nodes already in the graph
+- `concepts_known`   -- KnowledgeMemory nodes already in the graph
+- `similar_memories` -- top BM25 matches across all types
+- `recent_experiences` -- ExperienceMemory from last 7 days
 
-Output this exact JSON:
-{{
-  "overall_sentiment": 0.0,
-  "memories": [
-    {{
-      "index": 0,
-      "type": "EXPERIENCE|KNOWLEDGE|RELATIONSHIP",
-      "content": "one or two sentence memory summary",
-      "importance": 0.8,
-      "tags": [],
+For each draft memory, look for matches in existing_context.
 
-      "event_type": "conversation",
-      "participants": [],
-      "emotional_tone": 0.0,
-      "lessons_learned": [],
-      "timestamp": "{session_date}T00:00:00",
+STEP 4 -- DECIDE THE OPERATION.
 
-      "concept": null,
-      "definition": null,
-      "category": null,
-      "related_concepts": [],
+CREATE   -- No matching existing memory; create new node.
+UPDATE   -- Existing memory should change; specific fields have new values.
+           Specify exactly which fields in `update_fields`.
+ENHANCE  -- Add new info to existing without replacing; list fields grow.
+           Specify which list fields and what items to add in `enhance_additions`.
+SKIP     -- Existing memory already captures it; just reinforce (no new node).
+CONTRADICT -- New info fundamentally reverses existing (trust broken, opinion
+             flipped). New node will be created; old marked superseded.
 
-      "person_name": null,
-      "relationship_type": null,
-      "emotional_connection": 0.0,
-      "personality_traits": [],
-      "interests": [],
-      "trust_level": 0.5
-    }}
+Type-specific rules:
+- RELATIONSHIP: prefer ENHANCE or UPDATE (cumulative). Only CONTRADICT for
+  fundamental reversals. Never SKIP if new substance was learned.
+- KNOWLEDGE: UPDATE if understanding improved; ENHANCE for examples; SKIP if
+  identical restatement.
+- EXPERIENCE: SKIP if same event already captured; CREATE for different
+  episodes even if similar.
+
+STEP 5 -- IDENTIFY EDGES.
+Specify edges between operations and to existing nodes. Use these types:
+EXPERIENCE_CHAIN, EXPERIENCE_TO_KNOWLEDGE, KNOWLEDGE_TO_EXPERIENCE,
+EXPERIENCE_TO_RELATIONSHIP, RELATIONSHIP_TO_EXPERIENCE, KNOWLEDGE_HIERARCHY,
+RELATIONSHIP_NETWORK, CAUSED, RESULTED_IN, INFLUENCED, TRIGGERED,
+HAPPENED_BEFORE, HAPPENED_AFTER, CONCURRENT, SIMILAR_TO
+
+For edges between two of your newly-extracted memories, use `from_op_index`
+and `to_op_index`. For edges from a new memory to an existing graph node,
+use `to_node_id` (or `from_node_id`).
+
+# IMPORTANCE CALIBRATION
+
+- 0.4 (minimum to store): Mildly relevant. Worth knowing exists.
+- 0.6: Significant -- affects user's day or week.
+- 0.8: Major -- lasting impact.
+- 1.0: Foundational -- defines user's life or identity.
+
+If a memory's importance < 0.4, DROP IT entirely. Don't include in output.
+
+# CONTENT FORMAT
+
+- THIRD-PERSON factual: "User had a conflict with Sarah over the deployment."
+- NOT first-person: "I had a conflict with Sarah."
+- One to two sentences. Specific.
+
+# OUTPUT FORMAT
+
+Output STRICTLY this JSON (no markdown fences, no commentary, no preamble):
+
+{
+  "reasoning": "1-3 sentences on what was signal vs noise",
+  "session_summary": "one-line summary",
+  "overall_sentiment": -1.0 to 1.0,
+  "operations": [
+    {
+      "op_index": 0,
+      "operation": "CREATE",
+      "reason": "Why this op",
+      "memory": { ... full memory dict ... }
+    },
+    {
+      "op_index": 1,
+      "operation": "UPDATE",
+      "target_id": "existing-node-id",
+      "reason": "...",
+      "update_fields": {"field": value, ...}
+    },
+    {
+      "op_index": 2,
+      "operation": "ENHANCE",
+      "target_id": "existing-node-id",
+      "reason": "...",
+      "enhance_additions": {"list_field": [items], ...}
+    }
   ],
   "edges": [
-    {{
-      "from_index": 0,
-      "to_index": 1,
-      "rel_type": "EXPERIENCE_TO_RELATIONSHIP",
-      "strength": 0.8,
-      "bidirectional": false
-    }}
+    {"from_op_index": 0, "to_op_index": 1, "rel_type": "EXPERIENCE_TO_RELATIONSHIP", "strength": 0.9}
   ]
-}}
+}
 
-Include only the fields relevant to each memory type. Skip memories with importance < 0.4."""
+If nothing is worth memorizing, return operations: [] and edges: [].
+Do not fabricate."""
 
 
-class ConversationAnalyzer:
+_AGENT_EXAMPLES = """# EXAMPLES OF CORRECT BEHAVIOR
+
+## EXAMPLE A -- Conversation introduces a new person and a related event
+
+INPUT CONVERSATION:
+USER: I had a brutal day. Sarah and I disagreed about the deployment timeline.
+ASSISTANT: That sounds rough. What happened?
+USER: She thinks we should ship tomorrow, I think we need another week. We've been
+working together for 2 years and never clashed this hard.
+ASSISTANT: Where did you land?
+USER: We didn't. Manager will decide tomorrow.
+
+EXISTING CONTEXT (relevant part):
+  people_known: []
+  similar_memories: []
+  recent_experiences: []
+
+EXPECTED OUTPUT:
+{
+  "reasoning": "Substantive conflict event with named person. Sarah is a 2-year colleague with no prior node -- both EXPERIENCE and RELATIONSHIP needed (cross-creation).",
+  "session_summary": "User had unresolved conflict with colleague Sarah over deployment timeline.",
+  "overall_sentiment": -0.6,
+  "operations": [
+    {
+      "op_index": 0,
+      "operation": "CREATE",
+      "reason": "Specific conflict event with emotional weight and unresolved status.",
+      "memory": {
+        "type": "EXPERIENCE",
+        "content": "User and Sarah had a heated disagreement over deployment timeline. User wants another week, Sarah wants to ship tomorrow. Unresolved; manager will decide.",
+        "importance": 0.75,
+        "event_type": "conflict",
+        "participants": ["Sarah"],
+        "emotional_tone": -0.6,
+        "lessons_learned": [],
+        "timestamp": "{session_date}T12:00:00",
+        "tags": ["work", "conflict", "deployment"]
+      }
+    },
+    {
+      "op_index": 1,
+      "operation": "CREATE",
+      "reason": "Sarah needs a canonical RelationshipMemory node (cross-creation rule).",
+      "memory": {
+        "type": "RELATIONSHIP",
+        "content": "Sarah is a long-time colleague (2 years). Recently in significant disagreement with user about deployment timing.",
+        "importance": 0.7,
+        "person_name": "Sarah",
+        "relationship_type": "colleague",
+        "emotional_connection": 0.3,
+        "personality_traits": [],
+        "interests": [],
+        "trust_level": 0.7,
+        "tags": ["work", "colleague"]
+      }
+    }
+  ],
+  "edges": [
+    {"from_op_index": 0, "to_op_index": 1, "rel_type": "EXPERIENCE_TO_RELATIONSHIP", "strength": 0.95}
+  ]
+}
+
+## EXAMPLE B -- Conversation references a person already in the graph
+
+INPUT CONVERSATION:
+USER: Sarah and I finally resolved the deployment thing. We're going with a 4-day
+compromise. She was actually really reasonable about it.
+ASSISTANT: That's great!
+USER: Yeah, my view of her has improved a lot today.
+
+EXISTING CONTEXT (relevant part):
+  people_known: [
+    {
+      "id": "rel_sarah_abc",
+      "person_name": "Sarah",
+      "relationship_type": "colleague",
+      "emotional_connection": 0.3,
+      "trust_level": 0.7,
+      "personality_traits": [],
+      "content": "Sarah is a long-time colleague. Recently in significant disagreement with user about deployment timing."
+    }
+  ]
+  recent_experiences: [
+    {
+      "id": "exp_conflict_xyz",
+      "content": "User and Sarah had a heated disagreement over deployment timeline...",
+      "timestamp": "..."
+    }
+  ]
+
+EXPECTED OUTPUT:
+{
+  "reasoning": "Resolution event involving known person Sarah. Existing relationship node should be UPDATED (emotional_connection improved) and ENHANCED (new trait: reasonable). New EXPERIENCE captures the resolution.",
+  "session_summary": "User and Sarah resolved deployment conflict with a 4-day compromise; user's view of her improved.",
+  "overall_sentiment": 0.5,
+  "operations": [
+    {
+      "op_index": 0,
+      "operation": "CREATE",
+      "reason": "Resolution event -- distinct from the earlier conflict experience.",
+      "memory": {
+        "type": "EXPERIENCE",
+        "content": "User and Sarah resolved the deployment-timeline conflict with a 4-day compromise. Sarah was reasonable.",
+        "importance": 0.65,
+        "event_type": "problem_solving",
+        "participants": ["Sarah"],
+        "emotional_tone": 0.5,
+        "lessons_learned": ["Sarah responds well to compromise"],
+        "timestamp": "{session_date}T12:00:00",
+        "tags": ["work", "resolution", "compromise"]
+      }
+    },
+    {
+      "op_index": 1,
+      "operation": "UPDATE",
+      "target_id": "rel_sarah_abc",
+      "reason": "User explicitly noted their view of Sarah improved.",
+      "update_fields": {"emotional_connection": 0.55}
+    },
+    {
+      "op_index": 2,
+      "operation": "ENHANCE",
+      "target_id": "rel_sarah_abc",
+      "reason": "New trait observed: reasonableness in conflict.",
+      "enhance_additions": {"personality_traits": ["reasonable"]}
+    }
+  ],
+  "edges": [
+    {"from_op_index": 0, "to_node_id": "rel_sarah_abc", "rel_type": "EXPERIENCE_TO_RELATIONSHIP", "strength": 0.9},
+    {"from_node_id": "exp_conflict_xyz", "to_op_index": 0, "rel_type": "HAPPENED_BEFORE", "strength": 0.9},
+    {"from_op_index": 0, "to_node_id": "exp_conflict_xyz", "rel_type": "RESULTED_IN", "strength": 0.8}
+  ]
+}
+
+## EXAMPLE C -- Pure chitchat (extract NOTHING)
+
+INPUT CONVERSATION:
+USER: what's the weather like
+ASSISTANT: It's sunny and 72°F.
+USER: nice. thanks
+
+EXPECTED OUTPUT:
+{
+  "reasoning": "Pure Q&A about external weather. Nothing about user, no people, no events.",
+  "session_summary": "User asked about weather.",
+  "overall_sentiment": 0.0,
+  "operations": [],
+  "edges": []
+}
+
+## EXAMPLE D -- Hypothetical, dismissed
+
+INPUT CONVERSATION:
+USER: sometimes I wonder what would happen if I quit and moved to Portugal
+ASSISTANT: A change of scenery thought?
+USER: nah just daydreaming. not actually considering it.
+
+EXPECTED OUTPUT:
+{
+  "reasoning": "User explicitly framed as daydreaming, not real consideration. No actionable signal.",
+  "session_summary": "User briefly mused about a hypothetical move; dismissed as daydream.",
+  "overall_sentiment": 0.0,
+  "operations": [],
+  "edges": []
+}
+
+# END OF EXAMPLES -- NOW PROCESS THE ACTUAL SESSION BELOW.
+"""
+
+
+class GeminiAgent:
     """
-    Stage 1: One LLM call extracts all typed memories + intra-session edges.
-    Retries on JSON parse failure. Falls back to raw EXPERIENCE node if all attempts fail.
+    Invokes Google's official Gemini CLI as a subprocess to produce a
+    consolidation plan.
+
+    Model selection happens OUTSIDE this code -- user configures the CLI
+    manually (model = gemini-3.1-pro-preview, mode = manual). This client
+    just invokes `gemini --yolo -p <prompt>` and parses the JSON output.
+
+    Latency target: 3-15s per session call. Acceptable for nightly batch.
     """
 
-    def __init__(self, groq: GroqClient):
-        self.groq = groq
-
-    async def analyze(
+    def __init__(
         self,
-        conversations: List[Dict[str, str]],
+        cli_path: str = "gemini",
+        timeout_s: int = 180,
+        extra_args: Optional[List[str]] = None,
+    ):
+        """
+        Args:
+            cli_path:   Path to the gemini binary. Default: "gemini" on PATH.
+            timeout_s:  Per-call timeout. 180s should cover even slow agent reasoning.
+            extra_args: Additional CLI flags (e.g., ["--quiet"]).
+        """
+        self.cli_path = cli_path
+        self.timeout_s = timeout_s
+        self.extra_args = list(extra_args or [])
+
+    async def plan(
+        self,
+        session_id: str,
         user_id: str,
         session_date: str,
-        max_retries: int = 2,
-    ) -> ExtractionResult:
-        conv_text = "\n".join(
-            f"{m.get('role', '?').upper()}: {m.get('content', '')}"
-            for m in conversations
-        )
-        if len(conv_text) > 6000:
-            conv_text = conv_text[:6000] + "\n[truncated]"
-
-        user_prompt = _EXTRACTION_USER.format(
+        conversations: List[Dict[str, str]],
+        existing_context: Dict[str, Any],
+    ) -> Optional[ConsolidationPlan]:
+        """Run the agent for one session, return the parsed plan or None on failure."""
+        prompt = self._build_prompt(
             user_id=user_id,
             session_date=session_date,
-            conversation_text=conv_text,
+            conversations=conversations,
+            existing_context=existing_context,
         )
 
-        for attempt in range(max_retries + 1):
-            raw = await self.groq.call(
-                tier="smart",
-                system=_EXTRACTION_SYSTEM,
-                user=user_prompt,
-                json_mode=True,
-                estimated_tokens=len(conv_text) // 3 + 1500,
+        raw = await self._invoke(prompt)
+        if not raw:
+            observer.warning("agent returned empty output", session_id=session_id)
+            return None
+
+        json_str = _extract_json(raw)
+        if not json_str:
+            observer.warning(
+                "agent output had no extractable JSON",
+                session_id=session_id,
+                head=raw[:300],
             )
-            if raw is None:
-                continue
-            try:
-                data = json.loads(raw)
-                return self._parse(data, session_date)
-            except (json.JSONDecodeError, KeyError) as exc:
-                observer.warning(f"[analyzer] Parse failed attempt {attempt + 1}: {exc}")
+            return None
 
-        observer.warning("[analyzer] All attempts failed — fallback extraction")
-        return self._fallback(conversations, session_date)
+        try:
+            data = json.loads(json_str)
+        except json.JSONDecodeError as exc:
+            observer.warning(
+                "agent JSON parse failed",
+                session_id=session_id,
+                error=str(exc),
+                head=json_str[:300],
+            )
+            return None
 
-    def _parse(self, data: Dict, session_date: str) -> ExtractionResult:
-        memories: List[ExtractedMemory] = []
-        for raw_m in data.get("memories", []):
-            m = self._parse_memory(raw_m, session_date)
-            if m is not None:
-                memories.append(m)
+        return self._parse_plan(session_id, data, session_date)
 
-        valid_idx = {m.index for m in memories}
-        edges: List[ExtractedEdge] = []
-        for raw_e in data.get("edges", []):
-            fi = raw_e.get("from_index", -1)
-            ti = raw_e.get("to_index", -1)
-            if fi in valid_idx and ti in valid_idx and fi != ti:
-                edges.append(ExtractedEdge(
-                    from_index=fi,
-                    to_index=ti,
-                    rel_type=str(raw_e.get("rel_type", "ASSOCIATED_WITH")),
-                    strength=float(raw_e.get("strength", 0.7)),
-                    bidirectional=bool(raw_e.get("bidirectional", False)),
-                ))
+    # -- Prompt construction ----------------------------------------------------
 
-        return ExtractionResult(
-            memories=memories,
-            edges=edges,
-            overall_sentiment=float(data.get("overall_sentiment", 0.0)),
+    def _build_prompt(
+        self,
+        user_id: str,
+        session_date: str,
+        conversations: List[Dict[str, str]],
+        existing_context: Dict[str, Any],
+    ) -> str:
+        conv_text = "\n".join(
+            f"{str(m.get('role', '?')).upper()}: {str(m.get('content', '')).strip()}"
+            for m in conversations
+            if m.get("content")
         )
 
-    def _parse_memory(self, raw: Dict, session_date: str) -> Optional[ExtractedMemory]:
+        examples_filled = _AGENT_EXAMPLES.replace("{session_date}", session_date)
+
+        context_block = self._format_context(existing_context)
+
+        prompt = (
+            _AGENT_SYSTEM_INSTRUCTION
+            + "\n\n"
+            + examples_filled
+            + "\n\n"
+            + f"USER ID: {user_id}\n"
+            + f"SESSION DATE: {session_date}\n"
+            + f"DEFAULT TIMESTAMP (when event time is unclear): {session_date}T12:00:00\n\n"
+            + "=== EXISTING MEMORY CONTEXT ===\n"
+            + context_block
+            + "\n=== END EXISTING CONTEXT ===\n\n"
+            + "=== CONVERSATION TO CONSOLIDATE ===\n"
+            + conv_text
+            + "\n=== END CONVERSATION ===\n\n"
+            + "Now produce the consolidation plan as strict JSON. "
+            + "Do NOT wrap in markdown fences. Do NOT include commentary outside the JSON. "
+            + "Start your response with { and end with }.\n"
+        )
+
+        return prompt
+
+    @staticmethod
+    def _format_context(ctx: Dict[str, Any]) -> str:
+        """Render the pre-fetched context as readable text for the agent."""
+        out = []
+
+        people = ctx.get("people_known") or []
+        if people:
+            out.append("PEOPLE ALREADY KNOWN (consider UPDATE / ENHANCE / CONTRADICT):")
+            for p in people[:30]:
+                traits = p.get("personality_traits") or []
+                interests = p.get("interests") or []
+                out.append(
+                    f"  - id={p.get('id')}\n"
+                    f"    person_name: {p.get('person_name')}\n"
+                    f"    relationship_type: {p.get('relationship_type')}\n"
+                    f"    emotional_connection: {p.get('emotional_connection')}\n"
+                    f"    trust_level: {p.get('trust_level')}\n"
+                    f"    personality_traits: {traits}\n"
+                    f"    interests: {interests}\n"
+                    f"    content: {p.get('content')}"
+                )
+            out.append("")
+
+        concepts = ctx.get("concepts_known") or []
+        if concepts:
+            out.append("CONCEPTS ALREADY KNOWN:")
+            for c in concepts[:20]:
+                out.append(
+                    f"  - id={c.get('id')}\n"
+                    f"    concept: {c.get('concept')}\n"
+                    f"    category: {c.get('category')}\n"
+                    f"    definition: {c.get('definition')}"
+                )
+            out.append("")
+
+        recent = ctx.get("recent_experiences") or []
+        if recent:
+            out.append("RECENT EXPERIENCES (last 7 days):")
+            for r in recent[:15]:
+                out.append(
+                    f"  - id={r.get('id')}\n"
+                    f"    timestamp: {r.get('timestamp')}\n"
+                    f"    event_type: {r.get('event_type')}\n"
+                    f"    participants: {r.get('participants')}\n"
+                    f"    emotional_tone: {r.get('emotional_tone')}\n"
+                    f"    content: {r.get('content')}"
+                )
+            out.append("")
+
+        similar = ctx.get("similar_memories") or []
+        if similar:
+            out.append("OTHER SIMILAR MEMORIES (BM25-matched):")
+            for s in similar[:20]:
+                label = s.get("label") or s.get("type")
+                if isinstance(label, list):
+                    label = label[0] if label else "Memory"
+                out.append(
+                    f"  - id={s.get('id')}\n"
+                    f"    type: {label}\n"
+                    f"    bm25_score: {s.get('bm25_score')}\n"
+                    f"    content: {s.get('content')}"
+                )
+            out.append("")
+
+        if not out:
+            return "(Graph is empty -- no existing context. All memories will be CREATE operations.)"
+
+        return "\n".join(out)
+
+    # -- Subprocess invocation --------------------------------------------------
+
+    async def _invoke(self, prompt: str) -> Optional[str]:
+        """
+        Invoke Google's official Gemini CLI, piping the prompt via stdin.
+
+        We DON'T use `-p "<prompt>"` because the full prompt (system + 5
+        worked examples + conversation + pre-fetched context) exceeds the
+        Windows cmd.exe 8KB argv limit. Stdin handles arbitrary length.
+
+        Flags:
+          --yolo        auto-approve all tool actions (non-interactive)
+          --skip-trust  bypass workspace-trust prompt for headless use
+        """
+        resolved = _resolve_gemini_binary(self.cli_path)
+        if resolved is None:
+            observer.error(
+                "gemini cli not found",
+                cli_path=self.cli_path,
+                hint="install Google Gemini CLI or pass cli_path=...",
+            )
+            return None
+
+        # No -p flag — feed prompt through stdin. Smaller argv, no length limits.
+        args = ["--yolo", "--skip-trust"] + list(self.extra_args)
+        prompt_bytes = prompt.encode("utf-8")
+
+        try:
+            proc = await _spawn_gemini(resolved, *args, stdin_data=prompt_bytes)
+            try:
+                stdout, stderr = await asyncio.wait_for(
+                    proc.communicate(input=prompt_bytes),
+                    timeout=self.timeout_s,
+                )
+            except asyncio.TimeoutError:
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+                observer.warning("gemini cli timeout", timeout_s=self.timeout_s)
+                return None
+
+            if proc.returncode != 0:
+                observer.error(
+                    "gemini cli non-zero exit",
+                    returncode=proc.returncode,
+                    stderr=stderr.decode(errors="replace")[:500],
+                )
+                return None
+
+            raw = stdout.decode(errors="replace").strip()
+            return raw or None
+
+        except FileNotFoundError:
+            observer.error("gemini binary not executable", resolved=resolved)
+            return None
+        except Exception as exc:
+            observer.error("gemini cli call failed", exception=exc)
+            return None
+
+    # -- Plan parsing + validation ----------------------------------------------
+
+    def _parse_plan(
+        self, session_id: str, data: Dict, session_date: str,
+    ) -> ConsolidationPlan:
+        plan = ConsolidationPlan(
+            session_id=session_id,
+            reasoning=str(data.get("reasoning") or "")[:1000],
+            session_summary=str(data.get("session_summary") or "")[:500],
+            overall_sentiment=_clamp(data.get("overall_sentiment", 0.0), -1.0, 1.0),
+        )
+
+        raw_ops = data.get("operations") or []
+        for i, raw in enumerate(raw_ops):
+            op = self._parse_operation(raw, i, session_date)
+            if op is not None:
+                plan.operations.append(op)
+
+        valid_op_indices = {op.op_index for op in plan.operations}
+        raw_edges = data.get("edges") or []
+        for raw in raw_edges:
+            edge = self._parse_edge(raw, valid_op_indices)
+            if edge is not None:
+                plan.edges.append(edge)
+
+        return plan
+
+    def _parse_operation(
+        self, raw: Dict, fallback_index: int, session_date: str,
+    ) -> Optional[PlanOperation]:
+        if not isinstance(raw, dict):
+            return None
+        op_str = str(raw.get("operation", "")).upper()
+        if op_str not in ("CREATE", "UPDATE", "ENHANCE", "SKIP", "CONTRADICT"):
+            return None
+
+        try:
+            op_index = int(raw.get("op_index", fallback_index))
+        except (TypeError, ValueError):
+            op_index = fallback_index
+
+        op = PlanOperation(
+            op_index=op_index,
+            operation=op_str,
+            reason=str(raw.get("reason", ""))[:500],
+            target_id=raw.get("target_id"),
+            update_fields=dict(raw.get("update_fields") or {}),
+            enhance_additions=_normalize_list_dict(raw.get("enhance_additions")),
+        )
+
+        # CREATE / CONTRADICT need a memory dict
+        if op_str in ("CREATE", "CONTRADICT"):
+            mem = self._parse_memory(raw.get("memory"), op_index, session_date)
+            if mem is None:
+                return None
+            op.memory = mem
+
+        # UPDATE / ENHANCE / SKIP / CONTRADICT need a target_id
+        if op_str in ("UPDATE", "ENHANCE", "SKIP") and not op.target_id:
+            return None
+        if op_str == "CONTRADICT" and not op.target_id:
+            return None
+
+        return op
+
+    def _parse_memory(
+        self, raw: Any, op_index: int, session_date: str,
+    ) -> Optional[ExtractedMemory]:
+        if not isinstance(raw, dict):
+            return None
+
         mem_type = str(raw.get("type", "")).upper()
         if mem_type not in ("EXPERIENCE", "KNOWLEDGE", "RELATIONSHIP"):
             return None
 
         content = str(raw.get("content", "")).strip()
-        if not content:
+        if len(content) < 10:
             return None
 
-        importance = float(raw.get("importance", 0.5))
+        try:
+            importance = float(raw.get("importance", 0.5))
+        except (TypeError, ValueError):
+            importance = 0.5
         if importance < 0.4:
             return None
+        importance = min(importance, 1.0)
 
-        # Type-specific required field validation
         if mem_type == "EXPERIENCE":
-            if not raw.get("event_type"):
-                raw["event_type"] = "conversation"
-            if not raw.get("timestamp"):
-                raw["timestamp"] = f"{session_date}T00:00:00"
+            event_type = str(raw.get("event_type") or "conversation").lower()
+            if event_type not in _VALID_EVENT_TYPES:
+                event_type = "other"
+            timestamp = raw.get("timestamp") or f"{session_date}T12:00:00"
         elif mem_type == "KNOWLEDGE":
             if not raw.get("concept") or not raw.get("definition"):
                 return None
-        elif mem_type == "RELATIONSHIP":
+            event_type = None
+            timestamp = None
+        else:  # RELATIONSHIP
             if not raw.get("person_name"):
                 return None
+            event_type = None
+            timestamp = None
+
+        category = str(raw.get("category") or "other").lower()
+        if category not in _VALID_CATEGORIES:
+            category = "other"
+
+        rel_type = str(raw.get("relationship_type") or "other").lower()
+        if rel_type not in _VALID_RELATIONSHIP_TYPES:
+            rel_type = "other"
 
         return ExtractedMemory(
-            index=int(raw.get("index", 0)),
+            op_index=op_index,
             type=mem_type,
             content=content,
             importance=importance,
-            tags=list(raw.get("tags") or []),
-            event_type=raw.get("event_type"),
-            participants=list(raw.get("participants") or []),
-            emotional_tone=float(raw.get("emotional_tone") or 0.0),
-            lessons_learned=list(raw.get("lessons_learned") or []),
-            timestamp=raw.get("timestamp"),
-            concept=raw.get("concept"),
-            definition=raw.get("definition"),
-            category=str(raw.get("category") or "other"),
-            related_concepts=list(raw.get("related_concepts") or []),
-            person_name=raw.get("person_name"),
-            relationship_type=str(raw.get("relationship_type") or "other"),
-            emotional_connection=float(raw.get("emotional_connection") or 0.0),
-            personality_traits=list(raw.get("personality_traits") or []),
-            interests=list(raw.get("interests") or []),
-            trust_level=float(raw.get("trust_level") or 0.5),
+            tags=_clean_string_list(raw.get("tags")),
+            event_type=event_type,
+            participants=_clean_string_list(raw.get("participants")),
+            emotional_tone=_clamp(raw.get("emotional_tone", 0.0), -1.0, 1.0),
+            lessons_learned=_clean_string_list(raw.get("lessons_learned")),
+            timestamp=timestamp,
+            concept=str(raw["concept"]).strip() if raw.get("concept") else None,
+            definition=str(raw["definition"]).strip() if raw.get("definition") else None,
+            category=category,
+            related_concepts=_clean_string_list(raw.get("related_concepts")),
+            person_name=str(raw["person_name"]).strip() if raw.get("person_name") else None,
+            relationship_type=rel_type,
+            emotional_connection=_clamp(raw.get("emotional_connection", 0.0), -1.0, 1.0),
+            personality_traits=_clean_string_list(raw.get("personality_traits")),
+            interests=_clean_string_list(raw.get("interests")),
+            trust_level=_clamp(raw.get("trust_level", 0.5), 0.0, 1.0),
         )
 
-    def _fallback(self, conversations: List[Dict], session_date: str) -> ExtractionResult:
-        text = " ".join(c.get("content", "") for c in conversations)[:400]
-        return ExtractionResult(
-            memories=[ExtractedMemory(
-                index=0,
-                type="EXPERIENCE",
-                content=f"Conversation on {session_date}: {text}",
-                importance=0.4,
-                event_type="conversation",
-                timestamp=f"{session_date}T00:00:00",
-            )],
-            edges=[],
-        )
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# STAGE 2 — GRAPH MATCHER
-# ═══════════════════════════════════════════════════════════════════════════════
-
-class GraphMatcher:
-    """
-    Stage 2: Find existing Neo4j nodes that conflict with extracted memories.
-    No LLM. Pure database queries.
-
-    Matching strategy:
-      RELATIONSHIP → exact person_name match (case-insensitive). One canonical node per person.
-      KNOWLEDGE    → exact concept match, then BM25 fallback (threshold 2.5).
-      EXPERIENCE   → BM25 on content+participants, filtered to ±48h timestamp window.
-                     Content-similar but temporally distant = distinct events (not duplicates).
-    """
-
-    _BM25_THRESHOLD = 2.5
-    _EXPERIENCE_WINDOW_HOURS = 48
-
-    def __init__(self, neo4j: Neo4jClient):
-        self.neo4j = neo4j
-
-    async def match_all(self, memories: List[ExtractedMemory]) -> List[MatchedMemory]:
-        results = []
-        for mem in memories:
-            try:
-                matches = await self._match_one(mem)
-            except Exception as exc:
-                observer.warning(f"[matcher] Match failed for index {mem.index}: {exc}")
-                matches = []
-            results.append(MatchedMemory(extracted=mem, matches=matches))
-        return results
-
-    async def _match_one(self, mem: ExtractedMemory) -> List[ExistingMatch]:
-        if mem.type == "RELATIONSHIP":
-            return await self._match_relationship(mem)
-        elif mem.type == "KNOWLEDGE":
-            return await self._match_knowledge(mem)
-        else:
-            return await self._match_experience(mem)
-
-    async def _match_relationship(self, mem: ExtractedMemory) -> List[ExistingMatch]:
-        rows = await self.neo4j.execute_query(
-            """
-            MATCH (n:RelationshipMemory)
-            WHERE toLower(n.person_name) = toLower($name)
-            RETURN n.id AS id, n.content AS content,
-                   n.person_name AS person_name,
-                   n.relationship_type AS relationship_type,
-                   n.emotional_connection AS emotional_connection,
-                   n.personality_traits AS personality_traits,
-                   n.interests AS interests,
-                   n.trust_level AS trust_level
-            LIMIT 1
-            """,
-            {"name": mem.person_name or ""},
-        )
-        return [ExistingMatch(
-            node_id=str(r["id"]),
-            label="RelationshipMemory",
-            content=str(r.get("content", "")),
-            key_fields={k: r.get(k) for k in (
-                "person_name", "relationship_type", "emotional_connection",
-                "personality_traits", "interests", "trust_level",
-            )},
-            similarity=1.0,
-        ) for r in rows]
-
-    async def _match_knowledge(self, mem: ExtractedMemory) -> List[ExistingMatch]:
-        # Exact concept match first
-        rows = await self.neo4j.execute_query(
-            """
-            MATCH (n:KnowledgeMemory)
-            WHERE toLower(n.concept) = toLower($concept)
-            RETURN n.id AS id, n.content AS content,
-                   n.concept AS concept, n.definition AS definition,
-                   n.category AS category
-            LIMIT 1
-            """,
-            {"concept": mem.concept or ""},
-        )
-        if rows:
-            r = rows[0]
-            return [ExistingMatch(
-                node_id=str(r["id"]),
-                label="KnowledgeMemory",
-                content=str(r.get("content", "")),
-                key_fields={"concept": r.get("concept"), "definition": r.get("definition")},
-                similarity=1.0,
-            )]
-
-        # BM25 fallback
-        bm25_q = f"{mem.concept or ''} {mem.content[:100]}"
-        try:
-            rows = await self.neo4j.execute_query(
-                """
-                CALL db.index.fulltext.queryNodes("memory_fts", $q)
-                YIELD node, score
-                WHERE node:KnowledgeMemory AND score > $threshold
-                RETURN node.id AS id, node.content AS content,
-                       node.concept AS concept, node.definition AS definition, score
-                ORDER BY score DESC LIMIT 3
-                """,
-                {"q": bm25_q, "threshold": self._BM25_THRESHOLD},
-            )
-            return [ExistingMatch(
-                node_id=str(r["id"]),
-                label="KnowledgeMemory",
-                content=str(r.get("content", "")),
-                key_fields={"concept": r.get("concept"), "definition": r.get("definition")},
-                similarity=min(float(r.get("score", 0)) / 5.0, 1.0),
-            ) for r in rows]
-        except Exception as exc:
-            return []
-
-    async def _match_experience(self, mem: ExtractedMemory) -> List[ExistingMatch]:
-        bm25_q = " ".join(filter(None, [mem.content[:150]] + mem.participants[:3]))
-        if not bm25_q.strip():
-            return []
-
-        ts_str = mem.timestamp or datetime.datetime.now().isoformat()
-        try:
-            ts = datetime.datetime.fromisoformat(ts_str.replace("Z", ""))
-        except ValueError:
-            ts = datetime.datetime.now()
-
-        window_start = (ts - datetime.timedelta(hours=self._EXPERIENCE_WINDOW_HOURS)).isoformat()
-        window_end = (ts + datetime.timedelta(hours=self._EXPERIENCE_WINDOW_HOURS)).isoformat()
+    def _parse_edge(
+        self, raw: Dict, valid_op_indices: set,
+    ) -> Optional[PlanEdge]:
+        if not isinstance(raw, dict):
+            return None
 
         try:
-            rows = await self.neo4j.execute_query(
-                """
-                CALL db.index.fulltext.queryNodes("memory_fts", $q)
-                YIELD node, score
-                WHERE node:ExperienceMemory
-                  AND score > $threshold
-                  AND node.timestamp >= $window_start
-                  AND node.timestamp <= $window_end
-                RETURN node.id AS id, node.content AS content,
-                       node.event_type AS event_type,
-                       node.participants AS participants,
-                       node.timestamp AS timestamp,
-                       node.emotional_tone AS emotional_tone, score
-                ORDER BY score DESC LIMIT 3
-                """,
-                {
-                    "q": bm25_q,
-                    "threshold": self._BM25_THRESHOLD,
-                    "window_start": window_start,
-                    "window_end": window_end,
-                },
-            )
-            return [ExistingMatch(
-                node_id=str(r["id"]),
-                label="ExperienceMemory",
-                content=str(r.get("content", "")),
-                key_fields={
-                    "event_type": r.get("event_type"),
-                    "participants": r.get("participants", []),
-                    "timestamp": r.get("timestamp"),
-                    "emotional_tone": r.get("emotional_tone"),
-                },
-                similarity=min(float(r.get("score", 0)) / 5.0, 1.0),
-            ) for r in rows]
-        except Exception as exc:
-            return []
+            from_op = raw.get("from_op_index")
+            to_op = raw.get("to_op_index")
+            from_op = int(from_op) if from_op is not None else None
+            to_op = int(to_op) if to_op is not None else None
+        except (TypeError, ValueError):
+            from_op, to_op = None, None
 
+        from_id = raw.get("from_node_id") or None
+        to_id = raw.get("to_node_id") or None
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# STAGE 3 — CONFLICT RESOLVER
-# ═══════════════════════════════════════════════════════════════════════════════
+        # Need at least one endpoint specified
+        if from_op is None and not from_id:
+            return None
+        if to_op is None and not to_id:
+            return None
 
-_RESOLVE_SYSTEM = """You are a memory conflict resolver for a personal AI assistant's knowledge graph.
+        # op_index references must be valid
+        if from_op is not None and from_op not in valid_op_indices:
+            return None
+        if to_op is not None and to_op not in valid_op_indices:
+            return None
 
-You receive conflicts — cases where newly extracted memories resemble existing ones in the graph.
-Decide the correct operation for each:
+        rel_type = str(raw.get("rel_type") or "ASSOCIATED_WITH").upper()
+        if rel_type not in _VALID_EDGE_TYPES:
+            rel_type = "ASSOCIATED_WITH"
 
-UPDATE     — Specific fields in the existing node should change (mood shifted, opinion updated, new fact).
-             Specify exactly which fields and their new values in update_fields.
-ENHANCE    — Add new details to existing without replacing anything (new traits, examples, lessons).
-             List what to append to which list fields in enhance_additions.
-SKIP       — Existing already captures this. No new node needed. Existing will be reinforced.
-CONTRADICT — New info fundamentally reverses existing (trust broken, relationship ended, belief inverted).
-             A new node is created and the old one marked superseded.
-CREATE     — Despite resemblance, this is genuinely a distinct memory. Create it.
-
-Type-specific rules:
-- RELATIONSHIP: prefer ENHANCE or UPDATE — relationship info accumulates over time.
-  Only CONTRADICT for fundamental reversals (friend became enemy, trust completely broken).
-- KNOWLEDGE: UPDATE if understanding improved. ENHANCE if new examples/context added. SKIP if redundant.
-- EXPERIENCE: SKIP if the exact same event is already stored. CREATE if it's a different episode.
-
-Output JSON only. No commentary."""
-
-_RESOLVE_USER = """Resolve these conflicts:
-
-{conflicts_json}
-
-Output:
-{{
-  "resolutions": [
-    {{
-      "conflict_index": 0,
-      "operation": "UPDATE|ENHANCE|SKIP|CONTRADICT|CREATE",
-      "reason": "brief explanation",
-      "update_fields": {{}},
-      "enhance_additions": {{}}
-    }}
-  ]
-}}
-
-update_fields: field_name → new_value (UPDATE only)
-enhance_additions: list_field_name → [items to append] (ENHANCE only)"""
-
-
-class ConflictResolver:
-    """
-    Stage 3: LLM decides what to do with conflicting memories.
-    Only fires when Stage 2 found conflicts — skipped entirely on all-new sessions.
-    All conflicts batched into ONE call.
-    """
-
-    def __init__(self, groq: GroqClient):
-        self.groq = groq
-
-    async def resolve(self, matched: List[MatchedMemory]) -> List[OperationPlan]:
-        plans: List[OperationPlan] = []
-        conflicts = [(i, m) for i, m in enumerate(matched) if m.matches]
-        non_conflicts = [(i, m) for i, m in enumerate(matched) if not m.matches]
-
-        for _, m in non_conflicts:
-            plans.append(OperationPlan(
-                extracted=m.extracted,
-                operation="CREATE",
-                reason="No similar memory exists.",
-            ))
-
-        if not conflicts:
-            return plans
-
-        payload = []
-        for ci, (_, m) in enumerate(conflicts):
-            payload.append({
-                "conflict_index": ci,
-                "extracted": self._fmt_extracted(m.extracted),
-                "existing": [self._fmt_existing(e) for e in m.matches],
-            })
-
-        raw = await self.groq.call(
-            tier="smart",
-            system=_RESOLVE_SYSTEM,
-            user=_RESOLVE_USER.format(conflicts_json=json.dumps(payload, indent=2)),
-            json_mode=True,
-            estimated_tokens=len(json.dumps(payload)) // 3 + 1000,
+        return PlanEdge(
+            from_op_index=from_op,
+            from_node_id=str(from_id) if from_id else None,
+            to_op_index=to_op,
+            to_node_id=str(to_id) if to_id else None,
+            rel_type=rel_type,
+            strength=_clamp(raw.get("strength", 0.7), 0.0, 1.0),
+            bidirectional=bool(raw.get("bidirectional", False)),
         )
 
-        resolutions: Dict[int, Dict] = {}
-        if raw:
-            try:
-                parsed = json.loads(raw)
-                for r in parsed.get("resolutions", []):
-                    resolutions[int(r["conflict_index"])] = r
-            except (json.JSONDecodeError, KeyError, ValueError) as exc:
-                observer.warning(f"[resolver] Parse failed: {exc} — defaulting to ENHANCE")
 
-        for ci, (_, m) in enumerate(conflicts):
-            res = resolutions.get(ci, {})
-            op = str(res.get("operation", "ENHANCE")).upper()
-            if op not in ("UPDATE", "ENHANCE", "SKIP", "CONTRADICT", "CREATE"):
-                op = "ENHANCE"
-            best = m.matches[0]
-            plans.append(OperationPlan(
-                extracted=m.extracted,
-                operation=op,
-                target_id=best.node_id if op != "CREATE" else None,
-                update_fields=dict(res.get("update_fields") or {}),
-                reason=str(res.get("reason", "")),
-            ))
+# ===============================================================================
+# PLAN EXECUTOR
+# Applies the plan deterministically: writes nodes, creates edges.
+# ===============================================================================
 
-        plans.sort(key=lambda p: p.extracted.index)
-        return plans
+_VALID_EVENT_TYPES = {
+    "conversation", "meeting", "activity", "learning", "work", "social",
+    "problem_solving", "conflict", "celebration", "milestone", "other",
+}
+_VALID_CATEGORIES = {
+    "technology", "work", "health", "finance", "education", "social",
+    "personal", "relationship", "philosophy", "other",
+}
+_VALID_RELATIONSHIP_TYPES = {
+    "friend", "family", "colleague", "mentor", "acquaintance", "romantic",
+    "partner", "parent", "sibling", "child", "other",
+}
+_VALID_EDGE_TYPES = {e.value for e in MemoryRelationshipType}
 
-    def _fmt_extracted(self, m: ExtractedMemory) -> Dict:
-        d: Dict[str, Any] = {"type": m.type, "content": m.content, "importance": m.importance}
-        if m.type == "EXPERIENCE":
-            d.update({"participants": m.participants, "emotional_tone": m.emotional_tone,
-                       "lessons": m.lessons_learned, "timestamp": m.timestamp})
-        elif m.type == "KNOWLEDGE":
-            d.update({"concept": m.concept, "definition": m.definition})
-        elif m.type == "RELATIONSHIP":
-            d.update({"person": m.person_name, "emotional_connection": m.emotional_connection,
-                       "traits": m.personality_traits, "interests": m.interests,
-                       "trust": m.trust_level})
-        return d
-
-    def _fmt_existing(self, e: ExistingMatch) -> Dict:
-        return {"id": e.node_id, "content": e.content,
-                "similarity": round(e.similarity, 2), "fields": e.key_fields}
+_EDGE_REVERSALS = {
+    "EXPERIENCE_TO_RELATIONSHIP": "RELATIONSHIP_TO_EXPERIENCE",
+    "RELATIONSHIP_TO_EXPERIENCE": "EXPERIENCE_TO_RELATIONSHIP",
+    "EXPERIENCE_TO_KNOWLEDGE":    "KNOWLEDGE_TO_EXPERIENCE",
+    "KNOWLEDGE_TO_EXPERIENCE":    "EXPERIENCE_TO_KNOWLEDGE",
+    "HAPPENED_BEFORE":            "HAPPENED_AFTER",
+    "HAPPENED_AFTER":             "HAPPENED_BEFORE",
+    "CAUSED":                     "RESULTED_IN",
+    "RESULTED_IN":                "CAUSED",
+}
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# STAGE 4 — MEMORY WRITER
-# ═══════════════════════════════════════════════════════════════════════════════
-
-class MemoryWriter:
+class PlanExecutor:
     """
-    Stage 4: Execute operation plans. Write correctly-typed nodes to Neo4j.
+    Applies a ConsolidationPlan to Neo4j.
 
-    Key behaviors:
-    - MERGE (not CREATE) for canonical types: RelationshipMemory on person_name,
-      KnowledgeMemory on concept. Prevents duplicate nodes across sessions.
-    - Batch embedding before writes — one encode() call per session, not per node.
-    - ENHANCE uses Cypher list deduplication — never re-adds items already in a list field.
-    - CONTRADICT: creates new node + SUPERSEDED_BY edge. Old node preserved for lineage.
-    - SKIP: reinforces existing node (access_count++) without creating anything new.
-    - Per-node try/except: failure on one node doesn't abort the rest.
+    Pydantic-validates every CREATE/CONTRADICT before writing. UPDATE fields
+    are whitelisted per node label. ENHANCE uses Cypher list-dedup. Edges are
+    MERGEd (idempotent, dedup by (from, to, type)).
+
+    Per-operation try/except: one failure doesn't abort the rest.
     """
+
+    # Allowed UPDATE fields per node label (protects against agent hallucinating fields)
+    _UPDATE_WHITELIST: Dict[str, set] = {
+        "ExperienceMemory":   {"emotional_tone", "importance_score", "lessons_learned",
+                                "event_type", "tags"},
+        "KnowledgeMemory":    {"definition", "category", "importance_score",
+                                "related_concepts", "tags"},
+        "RelationshipMemory": {"emotional_connection", "trust_level",
+                                "relationship_type", "personality_traits",
+                                "interests", "importance_score", "tags"},
+    }
 
     def __init__(self, neo4j: Neo4jClient, embed: EmbeddingUtils):
         self.neo4j = neo4j
         self.embed = embed
 
-    async def execute(self, plans: List[OperationPlan]) -> Dict[int, SavedNode]:
-        to_embed = [(p.extracted.index, p.extracted.content)
-                    for p in plans if p.operation != "SKIP"]
-        embeddings = self._batch_embed(to_embed)
-
+    async def execute(self, plan: ConsolidationPlan) -> Tuple[Dict[int, SavedNode], int]:
+        """
+        Returns (saved_nodes_by_op_index, edges_created_count).
+        """
+        embeddings = self._batch_embed(plan)
         saved: Dict[int, SavedNode] = {}
-        for plan in plans:
+
+        for op in plan.operations:
             try:
-                node = await self._execute_one(plan, embeddings)
+                node = await self._apply_operation(op, embeddings)
                 if node:
-                    saved[plan.extracted.index] = node
+                    saved[op.op_index] = node
             except Exception as exc:
                 observer.error(
-                    f"[writer] {plan.operation} failed for index {plan.extracted.index}: {exc}",
+                    "operation execution failed",
+                    exception=exc,
+                    op_index=op.op_index,
+                    operation=op.operation,
                 )
-        return saved
 
-    def _batch_embed(self, items: List[Tuple[int, str]]) -> Dict[int, List[float]]:
-        result: Dict[int, List[float]] = {}
-        for idx, text in items:
+        edges_created = 0
+        for edge in plan.edges:
             try:
-                result[idx] = self.embed.generate_embedding(text)
+                if await self._apply_edge(edge, saved):
+                    edges_created += 1
+                    if edge.bidirectional:
+                        rev = PlanEdge(
+                            from_op_index=edge.to_op_index,
+                            from_node_id=edge.to_node_id,
+                            to_op_index=edge.from_op_index,
+                            to_node_id=edge.from_node_id,
+                            rel_type=_EDGE_REVERSALS.get(edge.rel_type, edge.rel_type),
+                            strength=edge.strength,
+                        )
+                        if await self._apply_edge(rev, saved):
+                            edges_created += 1
             except Exception as exc:
-                observer.warning(f"[writer] Embed failed for index {idx}: {exc}")
+                observer.warning("edge execution failed", exception=exc)
+
+        return saved, edges_created
+
+    # -- Embedding --------------------------------------------------------------
+
+    def _batch_embed(self, plan: ConsolidationPlan) -> Dict[int, List[float]]:
+        result: Dict[int, List[float]] = {}
+        for op in plan.operations:
+            if op.operation in ("CREATE", "CONTRADICT") and op.memory:
+                try:
+                    result[op.op_index] = self.embed.generate_embedding(
+                        op.memory.content
+                    )
+                except Exception as exc:
+                    observer.warning(
+                        "embedding failed",
+                        op_index=op.op_index,
+                        error=str(exc),
+                    )
         return result
 
-    async def _execute_one(
-        self, plan: OperationPlan, embeddings: Dict[int, List[float]]
-    ) -> Optional[SavedNode]:
-        m = plan.extracted
-        vec = embeddings.get(m.index)
-        now = datetime.datetime.now().isoformat()
+    # -- Operation dispatch -----------------------------------------------------
 
-        if plan.operation == "SKIP":
-            if plan.target_id:
-                await self._reinforce(plan.target_id, now)
+    async def _apply_operation(
+        self, op: PlanOperation, embeddings: Dict[int, List[float]],
+    ) -> Optional[SavedNode]:
+        now = datetime.datetime.now().isoformat()
+        vec = embeddings.get(op.op_index)
+
+        if op.operation == "SKIP":
+            if op.target_id:
+                await self._reinforce(op.target_id, now)
             return None
 
-        if plan.operation == "CREATE":
-            return await self._create(m, vec, now)
+        if op.operation == "CREATE":
+            if not op.memory:
+                return None
+            return await self._create(op, op.memory, vec, now)
 
-        if plan.operation == "UPDATE":
-            return await self._update(plan.target_id, plan.update_fields, m, vec, now)
+        if op.operation == "UPDATE":
+            if not op.target_id:
+                return None
+            return await self._update(op, now)
 
-        if plan.operation == "ENHANCE":
-            return await self._enhance(plan.target_id, m, now)
+        if op.operation == "ENHANCE":
+            if not op.target_id:
+                return None
+            return await self._enhance(op, now)
 
-        if plan.operation == "CONTRADICT":
-            node = await self._create(m, vec, now)
-            if node and plan.target_id:
-                await self._mark_superseded(plan.target_id, node.neo4j_id, now)
+        if op.operation == "CONTRADICT":
+            if not op.memory or not op.target_id:
+                return None
+            node = await self._create(op, op.memory, vec, now)
+            if node:
+                await self._mark_superseded(op.target_id, node.neo4j_id, now)
             return node
 
         return None
 
-    # ── CREATE ─────────────────────────────────────────────────────────────────
+    # -- CREATE -----------------------------------------------------------------
 
     async def _create(
-        self, m: ExtractedMemory, vec: Optional[List[float]], now: str
+        self, op: PlanOperation, m: ExtractedMemory,
+        vec: Optional[List[float]], now: str,
     ) -> Optional[SavedNode]:
-        from uuid import uuid4
         node_id = str(uuid4())
 
         if m.type == "EXPERIENCE":
-            props = {
-                "id": node_id,
-                "memory_context": "EXPERIENCE",
-                "content": m.content,
-                "content_vector": vec,
-                "event_type": m.event_type or "conversation",
-                "timestamp": m.timestamp or now,
-                "participants": m.participants,
-                "emotional_tone": m.emotional_tone,
-                "lessons_learned": m.lessons_learned,
-                "importance_score": m.importance,
-                "tags": m.tags,
-                "confidence": 0.85,
-                "access_count": 0,
-                "created_date": now,
-                "last_updated": now,
-            }
-            rows = await self.neo4j.execute_query(
-                "CREATE (n:ExperienceMemory $props) RETURN n.id AS id",
-                {"props": props},
-            )
-            if rows:
-                return SavedNode(m.index, node_id, "ExperienceMemory", "CREATE")
-
-        elif m.type == "KNOWLEDGE":
-            props = {
-                "id": node_id,
-                "memory_context": "KNOWLEDGE",
-                "content": m.content,
-                "content_vector": vec,
-                "concept": m.concept or m.content[:50],
-                "definition": m.definition or m.content,
-                "category": m.category or "other",
-                "related_concepts": m.related_concepts,
-                "importance_score": m.importance,
-                "tags": m.tags,
-                "confidence": 0.85,
-                "confidence_level": 0.85,
-                "access_count": 0,
-                "created_date": now,
-                "last_updated": now,
-            }
-            # MERGE on concept — canonical node per concept
-            rows = await self.neo4j.execute_query(
-                """
-                MERGE (n:KnowledgeMemory {concept: $concept})
-                ON CREATE SET n = $props
-                ON MATCH SET
-                    n.content = $content, n.last_updated = $now,
-                    n.importance_score = CASE WHEN $imp > n.importance_score THEN $imp ELSE n.importance_score END,
-                    n.content_vector = CASE WHEN $vec IS NOT NULL THEN $vec ELSE n.content_vector END
-                RETURN n.id AS id
-                """,
-                {"concept": m.concept, "props": props, "content": m.content,
-                 "now": now, "imp": m.importance, "vec": vec},
-            )
-            if rows:
-                actual_id = str(rows[0]["id"]) if rows[0].get("id") else node_id
-                return SavedNode(m.index, actual_id, "KnowledgeMemory", "CREATE")
-
-        elif m.type == "RELATIONSHIP":
-            props = {
-                "id": node_id,
-                "memory_context": "RELATIONSHIP",
-                "content": m.content,
-                "content_vector": vec,
-                "person_name": m.person_name,
-                "relationship_type": m.relationship_type or "other",
-                "emotional_connection": m.emotional_connection,
-                "personality_traits": m.personality_traits,
-                "interests": m.interests,
-                "trust_level": m.trust_level,
-                "relationship_strength": 0.5,
-                "importance_score": m.importance,
-                "tags": m.tags,
-                "confidence": 0.85,
-                "access_count": 0,
-                "created_date": now,
-                "last_updated": now,
-            }
-            # MERGE on person_name — single canonical node per person
-            rows = await self.neo4j.execute_query(
-                """
-                MERGE (n:RelationshipMemory {person_name: $person_name})
-                ON CREATE SET n = $props
-                ON MATCH SET
-                    n.content = $content, n.last_updated = $now,
-                    n.emotional_connection = $ec, n.trust_level = $trust,
-                    n.importance_score = CASE WHEN $imp > n.importance_score THEN $imp ELSE n.importance_score END,
-                    n.content_vector = CASE WHEN $vec IS NOT NULL THEN $vec ELSE n.content_vector END
-                RETURN n.id AS id
-                """,
-                {"person_name": m.person_name, "props": props, "content": m.content,
-                 "now": now, "ec": m.emotional_connection, "trust": m.trust_level,
-                 "imp": m.importance, "vec": vec},
-            )
-            if rows:
-                actual_id = str(rows[0]["id"]) if rows[0].get("id") else node_id
-                return SavedNode(m.index, actual_id, "RelationshipMemory", "CREATE")
-
+            return await self._create_experience(op, m, node_id, vec, now)
+        if m.type == "KNOWLEDGE":
+            return await self._create_knowledge(op, m, node_id, vec, now)
+        if m.type == "RELATIONSHIP":
+            return await self._create_relationship(op, m, node_id, vec, now)
         return None
 
-    # ── UPDATE ─────────────────────────────────────────────────────────────────
-
-    async def _update(
-        self,
-        target_id: str,
-        update_fields: Dict,
-        m: ExtractedMemory,
-        vec: Optional[List[float]],
-        now: str,
+    async def _create_experience(
+        self, op: PlanOperation, m: ExtractedMemory,
+        node_id: str, vec: Optional[List[float]], now: str,
     ) -> Optional[SavedNode]:
-        if not update_fields:
-            return await self._enhance(target_id, m, now)
+        try:
+            ExperienceMemoryNode(
+                id=node_id,
+                content=m.content,
+                content_vector=vec,
+                event_type=m.event_type or "conversation",
+                timestamp=_parse_iso_datetime(m.timestamp) or datetime.datetime.now(),
+                participants=m.participants,
+                emotional_tone=m.emotional_tone,
+                lessons_learned=m.lessons_learned,
+                importance_score=m.importance,
+                tags=m.tags,
+                confidence=0.85,
+            )
+        except Exception as exc:
+            observer.warning("ExperienceMemoryNode validation failed",
+                              error=str(exc)[:200])
+            return None
 
-        set_parts = ["n.last_updated = $now", "n.content = $content"]
-        params: Dict[str, Any] = {"node_id": target_id, "now": now, "content": m.content}
+        props = {
+            "id": node_id,
+            "memory_context": "EXPERIENCE",
+            "content": m.content,
+            "content_vector": vec,
+            "event_type": m.event_type or "conversation",
+            "timestamp": m.timestamp or now,
+            "participants": m.participants,
+            "emotional_tone": m.emotional_tone,
+            "lessons_learned": m.lessons_learned,
+            "importance_score": m.importance,
+            "tags": m.tags,
+            "confidence": 0.85,
+            "access_count": 0,
+            "created_date": now,
+            "last_updated": now,
+            "superseded": False,
+        }
+        rows = await self.neo4j.execute_query(
+            "CREATE (n:ExperienceMemory $props) RETURN n.id AS id",
+            {"props": props},
+        )
+        if rows:
+            return SavedNode(op.op_index, node_id, "ExperienceMemory", "CREATE")
+        return None
 
-        if vec:
-            set_parts.append("n.content_vector = $vec")
-            params["vec"] = vec
+    async def _create_knowledge(
+        self, op: PlanOperation, m: ExtractedMemory,
+        node_id: str, vec: Optional[List[float]], now: str,
+    ) -> Optional[SavedNode]:
+        concept_value = m.concept or m.content[:50]
+        try:
+            KnowledgeMemoryNode(
+                id=node_id, content=m.content, content_vector=vec,
+                concept=concept_value, definition=m.definition or m.content,
+                category=m.category or "other",
+                related_concepts=m.related_concepts,
+                importance_score=m.importance, tags=m.tags, confidence=0.85,
+            )
+        except Exception as exc:
+            observer.warning("KnowledgeMemoryNode validation failed",
+                              error=str(exc)[:200])
+            return None
 
-        for k, v in update_fields.items():
+        props = {
+            "id": node_id,
+            "memory_context": "KNOWLEDGE",
+            "content": m.content,
+            "content_vector": vec,
+            "concept": concept_value,
+            "definition": m.definition or m.content,
+            "category": m.category or "other",
+            "related_concepts": m.related_concepts,
+            "importance_score": m.importance,
+            "tags": m.tags,
+            "confidence": 0.85,
+            "confidence_level": 0.85,
+            "access_count": 0,
+            "created_date": now,
+            "last_updated": now,
+            "superseded": False,
+        }
+        rows = await self.neo4j.execute_query(
+            """
+            MERGE (n:KnowledgeMemory {concept: $concept})
+            ON CREATE SET n = $props
+            ON MATCH SET
+                n.content = $content, n.last_updated = $now,
+                n.importance_score = CASE
+                    WHEN $imp > n.importance_score THEN $imp
+                    ELSE n.importance_score END,
+                n.content_vector = coalesce($vec, n.content_vector)
+            RETURN n.id AS id
+            """,
+            {"concept": concept_value, "props": props, "content": m.content,
+             "now": now, "imp": m.importance, "vec": vec},
+        )
+        if rows:
+            actual_id = str(rows[0]["id"]) if rows[0].get("id") else node_id
+            return SavedNode(op.op_index, actual_id, "KnowledgeMemory", "CREATE")
+        return None
+
+    async def _create_relationship(
+        self, op: PlanOperation, m: ExtractedMemory,
+        node_id: str, vec: Optional[List[float]], now: str,
+    ) -> Optional[SavedNode]:
+        try:
+            RelationshipMemoryNode(
+                id=node_id, content=m.content, content_vector=vec,
+                person_name=m.person_name,
+                relationship_type=m.relationship_type or "other",
+                emotional_connection=m.emotional_connection,
+                personality_traits=m.personality_traits,
+                interests=m.interests, trust_level=m.trust_level,
+                importance_score=m.importance, tags=m.tags, confidence=0.85,
+            )
+        except Exception as exc:
+            observer.warning("RelationshipMemoryNode validation failed",
+                              error=str(exc)[:200])
+            return None
+
+        props = {
+            "id": node_id,
+            "memory_context": "RELATIONSHIP",
+            "content": m.content,
+            "content_vector": vec,
+            "person_name": m.person_name,
+            "relationship_type": m.relationship_type or "other",
+            "emotional_connection": m.emotional_connection,
+            "personality_traits": m.personality_traits,
+            "interests": m.interests,
+            "trust_level": m.trust_level,
+            "relationship_strength": 0.5,
+            "importance_score": m.importance,
+            "tags": m.tags,
+            "confidence": 0.85,
+            "access_count": 0,
+            "created_date": now,
+            "last_updated": now,
+            "superseded": False,
+        }
+        rows = await self.neo4j.execute_query(
+            """
+            MERGE (n:RelationshipMemory {person_name: $person_name})
+            ON CREATE SET n = $props
+            ON MATCH SET
+                n.content = $content, n.last_updated = $now,
+                n.emotional_connection = $ec, n.trust_level = $trust,
+                n.importance_score = CASE
+                    WHEN $imp > n.importance_score THEN $imp
+                    ELSE n.importance_score END,
+                n.content_vector = coalesce($vec, n.content_vector)
+            RETURN n.id AS id
+            """,
+            {"person_name": m.person_name, "props": props, "content": m.content,
+             "now": now, "ec": m.emotional_connection, "trust": m.trust_level,
+             "imp": m.importance, "vec": vec},
+        )
+        if rows:
+            actual_id = str(rows[0]["id"]) if rows[0].get("id") else node_id
+            return SavedNode(op.op_index, actual_id, "RelationshipMemory", "CREATE")
+        return None
+
+    # -- UPDATE -----------------------------------------------------------------
+
+    async def _update(self, op: PlanOperation, now: str) -> Optional[SavedNode]:
+        if not op.update_fields:
+            # Degrade to ENHANCE if no fields specified
+            return await self._enhance(op, now)
+
+        label_rows = await self.neo4j.execute_query(
+            "MATCH (n {id: $id}) RETURN labels(n)[0] AS label",
+            {"id": op.target_id},
+        )
+        if not label_rows:
+            return None
+        label = str(label_rows[0].get("label", ""))
+        whitelist = self._UPDATE_WHITELIST.get(label, set())
+
+        set_parts = ["n.last_updated = $now"]
+        params: Dict[str, Any] = {"node_id": op.target_id, "now": now}
+
+        applied: List[str] = []
+        for k, v in op.update_fields.items():
             safe = k.replace(" ", "_").replace("-", "_")
+            if safe not in whitelist:
+                continue
             pk = f"f_{safe}"
             set_parts.append(f"n.{safe} = ${pk}")
             params[pk] = v
+            applied.append(safe)
+
+        if not applied:
+            return None
 
         try:
             rows = await self.neo4j.execute_query(
@@ -940,26 +1516,30 @@ class MemoryWriter:
                 params,
             )
             if rows:
-                return SavedNode(m.index, target_id, str(rows[0].get("label", "")), "UPDATE")
+                return SavedNode(
+                    op.op_index, op.target_id, str(rows[0].get("label", "")),
+                    "UPDATE",
+                )
         except Exception as exc:
-            observer.error(f"[writer] UPDATE failed for {target_id}: {exc}")
+            observer.error("UPDATE failed", target_id=op.target_id, error=str(exc))
         return None
 
-    # ── ENHANCE ────────────────────────────────────────────────────────────────
+    # -- ENHANCE ----------------------------------------------------------------
 
-    async def _enhance(self, target_id: str, m: ExtractedMemory, now: str) -> Optional[SavedNode]:
-        """
-        Append-only enrichment. Cypher list deduplication ensures no re-added items.
-        Takes max on importance_score — importance only ever goes up.
-        """
+    async def _enhance(self, op: PlanOperation, now: str) -> Optional[SavedNode]:
+        adds = op.enhance_additions or {}
+        parts     = list(adds.get("participants") or [])
+        lessons   = list(adds.get("lessons_learned") or [])
+        traits    = list(adds.get("personality_traits") or [])
+        interests = list(adds.get("interests") or [])
+        tags      = list(adds.get("tags") or [])
+        related   = list(adds.get("related_concepts") or [])
+
         try:
             rows = await self.neo4j.execute_query(
                 """
                 MATCH (n {id: $node_id})
                 SET n.last_updated = $now,
-                    n.importance_score = CASE
-                        WHEN $imp > coalesce(n.importance_score, 0) THEN $imp
-                        ELSE n.importance_score END,
                     n.participants = CASE
                         WHEN n.participants IS NOT NULL
                         THEN [x IN $parts WHERE NOT x IN n.participants] + n.participants
@@ -979,26 +1559,29 @@ class MemoryWriter:
                     n.tags = CASE
                         WHEN n.tags IS NOT NULL
                         THEN [x IN $tags WHERE NOT x IN n.tags] + n.tags
-                        ELSE $tags END
+                        ELSE $tags END,
+                    n.related_concepts = CASE
+                        WHEN n.related_concepts IS NOT NULL
+                        THEN [x IN $related WHERE NOT x IN n.related_concepts] + n.related_concepts
+                        ELSE $related END
                 RETURN n.id AS id, labels(n)[0] AS label
                 """,
-                {
-                    "node_id": target_id, "now": now, "imp": m.importance,
-                    "parts": m.participants, "lessons": m.lessons_learned,
-                    "traits": m.personality_traits, "interests": m.interests,
-                    "tags": m.tags,
-                },
+                {"node_id": op.target_id, "now": now,
+                 "parts": parts, "lessons": lessons, "traits": traits,
+                 "interests": interests, "tags": tags, "related": related},
             )
             if rows:
-                return SavedNode(m.index, target_id, str(rows[0].get("label", "")), "ENHANCE")
+                return SavedNode(
+                    op.op_index, op.target_id, str(rows[0].get("label", "")),
+                    "ENHANCE",
+                )
         except Exception as exc:
-            observer.error(f"[writer] ENHANCE failed for {target_id}: {exc}")
+            observer.error("ENHANCE failed", target_id=op.target_id, error=str(exc))
         return None
 
-    # ── Helpers ────────────────────────────────────────────────────────────────
+    # -- CONTRADICT / SKIP helpers ----------------------------------------------
 
     async def _mark_superseded(self, old_id: str, new_id: str, now: str) -> None:
-        """CONTRADICT: link old node to new as superseded. Old content preserved."""
         try:
             await self.neo4j.execute_query(
                 """
@@ -1010,10 +1593,9 @@ class MemoryWriter:
                 {"old_id": old_id, "new_id": new_id, "now": now},
             )
         except Exception as exc:
-            observer.warning(f"[writer] SUPERSEDED_BY failed: {exc}")
+            observer.warning("SUPERSEDED_BY failed", error=str(exc))
 
     async def _reinforce(self, node_id: str, now: str) -> None:
-        """SKIP: existing already captures it — reinforce its ACT-R access stats."""
         try:
             await self.neo4j.execute_query(
                 """
@@ -1024,360 +1606,427 @@ class MemoryWriter:
                 {"node_id": node_id, "now": now},
             )
         except Exception as exc:
-            observer.warning(f"[writer] Reinforce failed for {node_id}: {exc}")
+            observer.warning("reinforce failed", error=str(exc))
 
+    # -- Edge creation ----------------------------------------------------------
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# STAGE 5 — GRAPH LINKER
-# ═══════════════════════════════════════════════════════════════════════════════
+    async def _apply_edge(
+        self, edge: PlanEdge, saved: Dict[int, SavedNode],
+    ) -> bool:
+        """Resolve op_index -> node_id, then MERGE the edge. Returns True on success."""
+        from_id = self._resolve_endpoint(edge.from_op_index, edge.from_node_id, saved)
+        to_id = self._resolve_endpoint(edge.to_op_index, edge.to_node_id, saved)
+        if not from_id or not to_id or from_id == to_id:
+            return False
 
-_VALID_EDGE_TYPES = {e.value for e in MemoryRelationshipType}
-
-_EDGE_REVERSALS = {
-    "EXPERIENCE_TO_RELATIONSHIP": "RELATIONSHIP_TO_EXPERIENCE",
-    "RELATIONSHIP_TO_EXPERIENCE": "EXPERIENCE_TO_RELATIONSHIP",
-    "EXPERIENCE_TO_KNOWLEDGE":    "KNOWLEDGE_TO_EXPERIENCE",
-    "KNOWLEDGE_TO_EXPERIENCE":    "EXPERIENCE_TO_KNOWLEDGE",
-    "HAPPENED_BEFORE":            "HAPPENED_AFTER",
-    "HAPPENED_AFTER":             "HAPPENED_BEFORE",
-    "CAUSED":                     "RESULTED_IN",
-    "RESULTED_IN":                "CAUSED",
-}
-
-
-class GraphLinker:
-    """
-    Stage 5: Build edges — intra-session (from extraction) and cross-session (entity bridges).
-
-    Intra-session: edges the LLM explicitly identified between extracted memories.
-    Cross-session: automatic bridges from new nodes to the existing graph —
-      - ExperienceMemory → RelationshipMemory for each participant
-      - ExperienceMemory → prior ExperienceMemory involving same people (temporal chain)
-      - RelationshipMemory → all prior experiences mentioning that person (backfill)
-      - KnowledgeMemory → related concepts already in graph (hierarchy)
-
-    Edge deduplication (Graphiti approach):
-      MERGE (a)-[r:TYPE]->(b) — if edge exists, strengthen it (evidence_count++, strength+0.05).
-      Never creates duplicate edges between the same node pair with the same type.
-    """
-
-    def __init__(self, neo4j: Neo4jClient):
-        self.neo4j = neo4j
-
-    async def link(self, saved: Dict[int, SavedNode], extraction: ExtractionResult) -> None:
+        rel_type = edge.rel_type if edge.rel_type in _VALID_EDGE_TYPES else "ASSOCIATED_WITH"
         now = datetime.datetime.now().isoformat()
-        index_to_id = {s.extracted_index: s.neo4j_id for s in saved.values()}
 
-        await self._link_intra_session(extraction.edges, index_to_id, now)
-
-        for idx, node in saved.items():
-            mem = next((m for m in extraction.memories if m.index == idx), None)
-            if mem:
-                await self._link_cross_session(node, mem, now)
-
-    async def _link_intra_session(
-        self, edges: List[ExtractedEdge], index_to_id: Dict[int, str], now: str
-    ) -> None:
-        for edge in edges:
-            from_id = index_to_id.get(edge.from_index)
-            to_id = index_to_id.get(edge.to_index)
-            if not from_id or not to_id:
-                continue
-            await self._merge_edge(from_id, to_id, edge.rel_type, edge.strength, now)
-            if edge.bidirectional:
-                rev = _EDGE_REVERSALS.get(edge.rel_type, edge.rel_type)
-                await self._merge_edge(to_id, from_id, rev, edge.strength, now)
-
-    async def _link_cross_session(self, node: SavedNode, mem: ExtractedMemory, now: str) -> None:
-        if mem.type == "EXPERIENCE":
-            for person in mem.participants:
-                await self._exp_to_person(node.neo4j_id, person, now)
-            if mem.participants:
-                await self._temporal_chain(node.neo4j_id, mem.participants, mem.timestamp, now)
-
-        elif mem.type == "RELATIONSHIP" and mem.person_name:
-            await self._person_to_experiences(node.neo4j_id, mem.person_name, now)
-
-        elif mem.type == "KNOWLEDGE" and mem.related_concepts:
-            await self._knowledge_hierarchy(node.neo4j_id, mem.related_concepts, now)
-
-    async def _exp_to_person(self, exp_id: str, person: str, now: str) -> None:
         try:
-            await self.neo4j.execute_query(
-                """
-                MATCH (exp {id: $exp_id})
-                MATCH (rel:RelationshipMemory)
-                WHERE toLower(rel.person_name) = toLower($person) AND rel.id <> $exp_id
-                MERGE (exp)-[r:EXPERIENCE_TO_RELATIONSHIP]->(rel)
-                ON CREATE SET r.strength = 0.7, r.created_date = $now, r.evidence_count = 1
-                ON MATCH  SET r.strength = least(1.0, coalesce(r.strength,0.7) + 0.05),
-                              r.evidence_count = coalesce(r.evidence_count, 1) + 1,
-                              r.last_reinforced = $now
-                """,
-                {"exp_id": exp_id, "person": person, "now": now},
-            )
-        except Exception:
-            pass
-
-    async def _temporal_chain(
-        self, new_id: str, participants: List[str], timestamp: Optional[str], now: str
-    ) -> None:
-        """Link new experience to most recent prior experience sharing any participant."""
-        if not timestamp:
-            return
-        try:
-            await self.neo4j.execute_query(
-                """
-                MATCH (new_exp {id: $new_id})
-                MATCH (old_exp:ExperienceMemory)
-                WHERE old_exp.id <> $new_id
-                  AND old_exp.timestamp < $timestamp
-                  AND any(p IN $participants WHERE toLower(p) IN
-                      [x IN coalesce(old_exp.participants, []) | toLower(x)])
-                WITH old_exp ORDER BY old_exp.timestamp DESC LIMIT 1
-                MERGE (old_exp)-[r1:HAPPENED_BEFORE]->(new_exp)
-                ON CREATE SET r1.strength = 0.8, r1.created_date = $now, r1.evidence_count = 1
-                ON MATCH  SET r1.evidence_count = coalesce(r1.evidence_count, 1) + 1
-                MERGE (new_exp)-[r2:HAPPENED_AFTER]->(old_exp)
-                ON CREATE SET r2.strength = 0.8, r2.created_date = $now, r2.evidence_count = 1
-                ON MATCH  SET r2.evidence_count = coalesce(r2.evidence_count, 1) + 1
-                """,
-                {"new_id": new_id, "timestamp": timestamp,
-                 "participants": participants, "now": now},
-            )
-        except Exception as exc:
-            pass
-
-    async def _person_to_experiences(self, rel_id: str, person_name: str, now: str) -> None:
-        """Backfill: link updated RelationshipMemory to all existing experiences mentioning them."""
-        try:
-            await self.neo4j.execute_query(
-                """
-                MATCH (rel {id: $rel_id})
-                MATCH (exp:ExperienceMemory)
-                WHERE exp.id <> $rel_id
-                  AND any(p IN coalesce(exp.participants,[]) WHERE toLower(p) = toLower($person))
-                MERGE (exp)-[r:EXPERIENCE_TO_RELATIONSHIP]->(rel)
-                ON CREATE SET r.strength = 0.6, r.created_date = $now, r.evidence_count = 1
-                ON MATCH  SET r.strength = least(1.0, coalesce(r.strength,0.6) + 0.03),
-                              r.evidence_count = coalesce(r.evidence_count, 1) + 1
-                """,
-                {"rel_id": rel_id, "person": person_name, "now": now},
-            )
-        except Exception as exc:
-            pass
-
-    async def _knowledge_hierarchy(
-        self, know_id: str, related: List[str], now: str
-    ) -> None:
-        try:
-            await self.neo4j.execute_query(
-                """
-                MATCH (new_k {id: $know_id})
-                MATCH (existing_k:KnowledgeMemory)
-                WHERE toLower(existing_k.concept) IN $related_lower AND existing_k.id <> $know_id
-                MERGE (new_k)-[r:KNOWLEDGE_HIERARCHY]->(existing_k)
-                ON CREATE SET r.strength = 0.6, r.created_date = $now, r.evidence_count = 1
-                ON MATCH  SET r.evidence_count = coalesce(r.evidence_count, 1) + 1
-                """,
-                {"know_id": know_id, "related_lower": [r.lower() for r in related], "now": now},
-            )
-        except Exception as exc:
-            pass
-
-    async def _merge_edge(
-        self, from_id: str, to_id: str, rel_type: str, strength: float, now: str
-    ) -> None:
-        safe_type = rel_type if rel_type in _VALID_EDGE_TYPES else "ASSOCIATED_WITH"
-        try:
-            await self.neo4j.execute_query(
+            result = await self.neo4j.execute_query(
                 f"""
                 MATCH (a {{id: $from_id}}), (b {{id: $to_id}})
-                MERGE (a)-[r:{safe_type}]->(b)
+                MERGE (a)-[r:{rel_type}]->(b)
                 ON CREATE SET r.strength = $strength, r.created_date = $now,
                               r.evidence_count = 1, r.last_reinforced = $now
-                ON MATCH  SET r.strength = least(1.0, coalesce(r.strength,0.5) + 0.05),
+                ON MATCH  SET r.strength = CASE WHEN coalesce(r.strength,0.5) + 0.05 > 1.0 THEN 1.0 ELSE coalesce(r.strength,0.5) + 0.05 END,
                               r.evidence_count = coalesce(r.evidence_count, 1) + 1,
                               r.last_reinforced = $now
+                RETURN b.id AS linked
                 """,
-                {"from_id": from_id, "to_id": to_id, "strength": strength, "now": now},
+                {"from_id": from_id, "to_id": to_id,
+                 "strength": edge.strength, "now": now},
             )
+            return bool(result)
         except Exception as exc:
-            pass
+            observer.warning("edge merge failed",
+                              edge_type=rel_type, error=str(exc))
+            return False
+
+    @staticmethod
+    def _resolve_endpoint(
+        op_index: Optional[int], node_id: Optional[str],
+        saved: Dict[int, SavedNode],
+    ) -> Optional[str]:
+        if node_id:
+            return str(node_id)
+        if op_index is not None and op_index in saved:
+            return saved[op_index].neo4j_id
+        return None
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# CONSOLIDATION ENGINE — COORDINATOR
-# ═══════════════════════════════════════════════════════════════════════════════
+# ===============================================================================
+# AGENTIC CONSOLIDATION ENGINE
+# ===============================================================================
 
-class ConsolidationEngine:
+class AgenticConsolidationEngine:
     """
-    Orchestrates the 5-stage pipeline. Runs nightly or on-demand.
+    Top-level orchestrator. One method per session: fetch context, call agent,
+    execute plan, return result.
 
-    Guarantees:
-    - Partial success: node N failing doesn't abort nodes N+1..M
-    - Idempotency: re-running on same session is safe (MERGE semantics throughout)
-    - Processed sessions deleted from conversation.json only on full success
-    - Failed sessions retained for next run
+    The runner script (`consolidation_runner.py`) loops over pending sessions
+    in conversation.json and calls this engine for each.
     """
-
-    TRIGGER_HOUR = 20
 
     def __init__(
         self,
         neo4j: Neo4jClient,
-        embed: EmbeddingUtils,
-        retrieval_engine: Optional[MemoryRetrievalEngine] = None,
+        embed: Optional[EmbeddingUtils] = None,
+        retrieval: Optional[MemoryRetrievalEngine] = None,
+        agent: Optional[GeminiAgent] = None,
     ):
         self.neo4j = neo4j
-        self.embed = embed
+        self.embed = embed or EmbeddingUtils()
+        self.retrieval = retrieval
+        self.agent = agent or GeminiAgent()
+        self.fetcher = ContextFetcher(neo4j, retrieval)
+        self.executor = PlanExecutor(neo4j, self.embed)
         self.cfg = get_config()
-        self.log_path = Path(self.cfg.conversation_log_path)
-        self.is_running = False
 
-        groq = GroqClient()
-        self.analyzer = ConversationAnalyzer(groq)
-        self.matcher  = GraphMatcher(neo4j)
-        self.resolver = ConflictResolver(groq)
-        self.writer   = MemoryWriter(neo4j, embed)
-        self.linker   = GraphLinker(neo4j)
+    async def consolidate_session(self, session: Dict) -> SessionResult:
+        """Run the full pipeline for one session. Returns SessionResult."""
+        session_id = str(session.get("session_id") or "unknown")
+        conversations = session.get("conversations") or []
+        session_date = _derive_session_date(session)
 
+        result = SessionResult(session_id=session_id, turns=len(conversations))
 
-    # ── Scheduler ─────────────────────────────────────────────────────────────
+        if not conversations:
+            result.succeeded = True
+            return result
 
-    async def start_scheduler(self) -> None:
-        self.is_running = True
-        while self.is_running:
-            try:
-                now = datetime.datetime.now()
-                if self.TRIGGER_HOUR <= now.hour < self.TRIGGER_HOUR + 1:
-                    await self.run_consolidation_once()
-                    sleep_s = self._seconds_until_tomorrow()
-                    await asyncio.sleep(sleep_s)
-                else:
-                    await asyncio.sleep(3600)
-            except Exception as exc:
-                observer.error(f"[consolidation] Scheduler error: {exc}")
-                await asyncio.sleep(3600)
-
-    def _seconds_until_tomorrow(self) -> float:
-        now = datetime.datetime.now()
-        tomorrow = (now + datetime.timedelta(days=1)).replace(hour=0, minute=1, second=0)
-        return (tomorrow - now).total_seconds()
-
-    # ── Main entry ─────────────────────────────────────────────────────────────
-
-    async def run_consolidation_once(self) -> Dict[str, Any]:
-        stats = {
-            "sessions_attempted": 0, "sessions_succeeded": 0,
-            "memories_created": 0, "memories_updated": 0, "sessions_failed": 0,
-        }
-
-        log_data = self._load_log()
-        if not log_data:
-            return stats
-
-        user_key = f"user_{self.cfg.user_id}"
-        sessions = log_data.get(user_key, [])
-        if not sessions:
-            return stats
-
-        keep = []
-        for session in sessions:
-            stats["sessions_attempted"] += 1
-            sid = session.get("session_id", "unknown")
-            convs = session.get("conversations", [])
-            if not convs:
-                continue
-
-            try:
-                result = await self._consolidate_session(convs, sid)
-                stats["sessions_succeeded"] += 1
-                stats["memories_created"] += result["created"]
-                stats["memories_updated"] += result["updated"]
-            except Exception as exc:
-                observer.error(f"[consolidation] ✗ {sid}: {exc}")
-                keep.append(session)
-                stats["sessions_failed"] += 1
-
-        log_data[user_key] = keep
-        self._save_log(log_data)
-        return stats
-
-    async def _consolidate_session(
-        self, conversations: List[Dict], session_id: str
-    ) -> Dict[str, int]:
-        session_date = datetime.date.today().isoformat()
-
-        # Stage 1
-        extraction = await self.analyzer.analyze(conversations, self.cfg.user_id, session_date)
-        if not extraction.memories:
-            return {"created": 0, "updated": 0}
-
-
-        # Stage 2
-        matched = await self.matcher.match_all(extraction.memories)
-        conflicts = sum(1 for m in matched if m.matches)
-
-        # Stage 3
-        plans = await self.resolver.resolve(matched)
-        ops: Dict[str, int] = {}
-        for p in plans:
-            ops[p.operation] = ops.get(p.operation, 0) + 1
-
-        # Stage 4
-        saved = await self.writer.execute(plans)
-
-        # Stage 5
-        await self.linker.link(saved, extraction)
-
-        created = sum(1 for p in plans if p.operation == "CREATE")
-        updated = sum(1 for p in plans if p.operation in ("UPDATE", "ENHANCE", "CONTRADICT"))
-        return {"created": created, "updated": updated}
-
-    # ── File helpers ───────────────────────────────────────────────────────────
-
-    def _load_log(self) -> Dict:
-        if not self.log_path.exists():
-            return {}
         try:
-            return json.loads(self.log_path.read_text(encoding="utf-8"))
-        except Exception as exc:
-            observer.error(f"[consolidation] Load log failed: {exc}")
-            return {}
+            # Stage 1: pre-fetch context
+            context = await self.fetcher.fetch(conversations)
 
-    def _save_log(self, data: Dict) -> None:
+            # Stage 2: agent produces plan
+            plan = await self.agent.plan(
+                session_id=session_id,
+                user_id=self.cfg.user_id,
+                session_date=session_date,
+                conversations=conversations,
+                existing_context=context,
+            )
+
+            if plan is None:
+                result.error = "agent failed to produce a valid plan"
+                return result
+
+            result.operations_planned = len(plan.operations)
+            result.reasoning = plan.reasoning
+            result.summary = plan.session_summary
+
+            # Empty plan = successful (nothing to consolidate)
+            if not plan.operations:
+                result.succeeded = True
+                observer.info(
+                    "session: no memories worth consolidating",
+                    session_id=session_id,
+                    summary=plan.session_summary,
+                )
+                return result
+
+            # Stage 3: execute
+            saved, edges_created = await self.executor.execute(plan)
+            result.edges_created = edges_created
+
+            for op in plan.operations:
+                if op.operation == "CREATE":
+                    result.nodes_created += 1
+                elif op.operation == "UPDATE":
+                    result.nodes_updated += 1
+                elif op.operation == "ENHANCE":
+                    result.nodes_enhanced += 1
+                elif op.operation == "SKIP":
+                    result.nodes_skipped += 1
+                elif op.operation == "CONTRADICT":
+                    result.nodes_superseded += 1
+
+            result.succeeded = True
+            observer.info(
+                "session consolidated",
+                session_id=session_id,
+                ops=result.operations_planned,
+                created=result.nodes_created,
+                updated=result.nodes_updated,
+                enhanced=result.nodes_enhanced,
+                edges=edges_created,
+            )
+
+        except Exception as exc:
+            result.error = f"{type(exc).__name__}: {exc}"
+            observer.error("session consolidation crashed",
+                            exception=exc, session_id=session_id)
+
+        return result
+
+
+# ===============================================================================
+# UTILITIES
+# ===============================================================================
+
+def _clamp(v: Any, lo: float, hi: float) -> float:
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return (lo + hi) / 2
+    return max(lo, min(hi, f))
+
+
+def _clean_string_list(value: Any) -> List[str]:
+    if not isinstance(value, list):
+        return []
+    out = []
+    for item in value:
+        if item is None:
+            continue
+        s = str(item).strip()
+        if s:
+            out.append(s)
+    return out
+
+
+def _normalize_list_dict(raw: Any) -> Dict[str, List[Any]]:
+    """{field: items} where items is always a list of non-None values."""
+    if not isinstance(raw, dict):
+        return {}
+    out: Dict[str, List[Any]] = {}
+    for k, v in raw.items():
+        if not isinstance(k, str):
+            continue
+        if isinstance(v, list):
+            out[k] = [i for i in v if i is not None]
+        elif v is not None:
+            out[k] = [v]
+    return out
+
+
+def _parse_iso_datetime(s: Optional[str]) -> Optional[datetime.datetime]:
+    if not s:
+        return None
+    try:
+        return datetime.datetime.fromisoformat(str(s).replace("Z", ""))
+    except (TypeError, ValueError):
+        return None
+
+
+def _derive_session_date(session: Dict) -> str:
+    """Use session.start_time when available, else first turn's timestamp, else today."""
+    start = session.get("start_time")
+    if start:
         try:
-            self.log_path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
-        except Exception as exc:
-            observer.error(f"[consolidation] Save log failed: {exc}")
+            return datetime.datetime.fromisoformat(
+                str(start).replace("Z", "")
+            ).date().isoformat()
+        except (TypeError, ValueError):
+            pass
+    convs = session.get("conversations") or []
+    if convs:
+        ts = convs[0].get("timestamp")
+        if ts:
+            try:
+                return datetime.datetime.fromisoformat(
+                    str(ts).replace("Z", "")
+                ).date().isoformat()
+            except (TypeError, ValueError):
+                pass
+    return datetime.date.today().isoformat()
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# FACTORY + CLI
-# ═══════════════════════════════════════════════════════════════════════════════
+def _extract_json(text: str) -> Optional[str]:
+    """
+    Extract balanced JSON from raw CLI output.
+    Handles markdown fences, prose preambles, and trailing commentary.
+    """
+    text = text.strip()
+    if not text:
+        return None
+
+    # Strip markdown code fences
+    fence = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
+    if fence:
+        return fence.group(1).strip()
+
+    # Find first '{' and balanced match
+    start = text.find("{")
+    if start < 0:
+        return None
+
+    depth, in_str, esc = 0, False, False
+    for i in range(start, len(text)):
+        ch = text[i]
+        if esc:
+            esc = False
+            continue
+        if ch == "\\" and in_str:
+            esc = True
+            continue
+        if ch == '"':
+            in_str = not in_str
+            continue
+        if in_str:
+            continue
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start : i + 1]
+
+    return None
+
+
+# ===============================================================================
+# PRE-FLIGHT HELPERS (used by the runner script)
+# ===============================================================================
+
+def _resolve_gemini_binary(cli_path: str) -> Optional[str]:
+    """
+    Resolve a Gemini CLI binary to an absolute, subprocess-executable path.
+
+    On Windows, npm-installed CLIs are typically .cmd/.bat wrappers.
+    shutil.which finds them via PATHEXT, but subprocess.create_subprocess_exec
+    requires the actual resolved path. Returns the resolved path or None.
+    """
+    resolved = shutil.which(cli_path)
+    if resolved:
+        return resolved
+    p = Path(cli_path)
+    if p.is_absolute() and p.exists():
+        return str(p)
+    return None
+
+
+async def _spawn_gemini(
+    binary: str, *args: str, stdin_data: Optional[bytes] = None,
+) -> asyncio.subprocess.Process:
+    """
+    Spawn the Gemini CLI in a way that works on both POSIX and Windows.
+
+    On Windows, .cmd/.bat wrappers require shell invocation (subprocess_exec
+    fails with WinError 193 for non-PE executables). Detect by extension.
+
+    If stdin_data is provided, the caller will write it after spawn. We just
+    set stdin=PIPE in that case.
+    """
+    import os as _os
+    is_windows_script = (
+        _os.name == "nt"
+        and binary.lower().endswith((".cmd", ".bat", ".ps1"))
+    )
+    stdin_pipe = asyncio.subprocess.PIPE if stdin_data is not None else None
+
+    if is_windows_script:
+        def _q(s: str) -> str:
+            return '"' + s.replace('"', '\\"') + '"'
+        cmd = " ".join([_q(binary)] + [_q(a) for a in args])
+        return await asyncio.create_subprocess_shell(
+            cmd,
+            stdin=stdin_pipe,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    return await asyncio.create_subprocess_exec(
+        binary, *args,
+        stdin=stdin_pipe,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+
+
+async def check_gemini_cli(cli_path: str = "gemini") -> Tuple[bool, str]:
+    """Returns (ok, message). Verifies the CLI binary exists and responds."""
+    resolved = _resolve_gemini_binary(cli_path)
+    if resolved is None:
+        return False, f"gemini CLI not found on PATH (tried '{cli_path}')"
+
+    try:
+        proc = await _spawn_gemini(resolved, "--version")
+        try:
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=15)
+        except asyncio.TimeoutError:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            return False, "gemini --version timed out"
+
+        if proc.returncode == 0:
+            ver = stdout.decode(errors="replace").strip().splitlines()[-1:] or [""]
+            return True, f"{resolved}  ({ver[0] or 'ok'})"
+        return False, f"--version returned exit {proc.returncode}"
+    except FileNotFoundError:
+        return False, f"resolved binary not executable: {resolved}"
+    except Exception as exc:
+        return False, f"check failed: {type(exc).__name__}: {exc}"
+
+
+async def check_gemini_auth(cli_path: str = "gemini") -> Tuple[bool, str]:
+    """
+    Verify auth by sending a trivial prompt to Google's Gemini CLI.
+    Latency: 3-30s on first call (auth handshake), 1-5s on subsequent.
+    """
+    resolved = _resolve_gemini_binary(cli_path)
+    if resolved is None:
+        return False, f"gemini CLI not found on PATH (tried '{cli_path}')"
+
+    try:
+        proc = await _spawn_gemini(
+            resolved, "--yolo", "--skip-trust",
+            "-p", "Reply with exactly: OK",
+        )
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(), timeout=90,
+            )
+        except asyncio.TimeoutError:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            return False, "auth check timed out (>90s) -- try `gemini` interactively first"
+
+        if proc.returncode != 0:
+            stderr_text = stderr.decode(errors="replace")[:200]
+            return False, f"exit {proc.returncode}: {stderr_text}"
+
+        text = stdout.decode(errors="replace").strip()
+        if len(text) == 0:
+            return False, "empty response -- auth may not be configured"
+        return True, f"auth ok ({text[:60]})"
+    except FileNotFoundError:
+        return False, f"binary not executable: {resolved}"
+    except Exception as exc:
+        return False, f"auth check failed: {type(exc).__name__}: {exc}"
+
+
+# ===============================================================================
+# FACTORY
+# ===============================================================================
 
 async def create_consolidation_engine(
-    neo4j_client: Neo4jClient,
-    embed_utils: EmbeddingUtils,
+    neo4j_client: Optional[Neo4jClient] = None,
+    embed_utils: Optional[EmbeddingUtils] = None,
     retrieval_engine: Optional[MemoryRetrievalEngine] = None,
-) -> ConsolidationEngine:
-    return ConsolidationEngine(neo4j_client, embed_utils, retrieval_engine)
-
-
-if __name__ == "__main__":
-    async def main():
+    gemini_cli_path: str = "gemini",
+    timeout_s: int = 180,
+) -> AgenticConsolidationEngine:
+    """Convenience factory. Connects Neo4j if not provided."""
+    if neo4j_client is None:
         cfg = get_config()
-        neo4j = create_neo4j_client(
+        neo4j_client = create_neo4j_client(
             uri=cfg.neo4j_uri,
             username=cfg.neo4j_username,
             password=cfg.neo4j_password,
             database=cfg.database,
         )
-        await neo4j.connect()
-        embed = EmbeddingUtils()
-        engine = ConsolidationEngine(neo4j, embed)
-        stats = await engine.run_consolidation_once()
-        await neo4j.disconnect()
+        await neo4j_client.connect()
 
-    asyncio.run(main())
+    embed = embed_utils or EmbeddingUtils()
+    agent = GeminiAgent(cli_path=gemini_cli_path, timeout_s=timeout_s)
+    return AgenticConsolidationEngine(
+        neo4j=neo4j_client,
+        embed=embed,
+        retrieval=retrieval_engine,
+        agent=agent,
+    )
