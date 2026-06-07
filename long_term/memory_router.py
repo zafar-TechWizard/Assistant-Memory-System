@@ -523,6 +523,17 @@ class MemoryRouter:
         # ── 2. Dynamic budget ─────────────────────────────────────────────────
         eff_budget = budget or self._budget(ir, entities)
 
+        # ── 2b. Fire emotional baseline early (independent of Phase A/B) ──────
+        # The aggregation only needs `entities`; nothing about it depends on
+        # Phase A results. Kick it off now so it overlaps with everything else.
+        emotional_baseline_task: Optional[asyncio.Task] = None
+        if ir.primary_intent == Intent.EMOTIONAL:
+            emotional_baseline_task = asyncio.create_task(
+                self._engine.get_emotions_summary(
+                    topic=entities[0] if entities else None
+                )
+            )
+
         # ── 3. Phase A: Tier 1 + Tier 2 CONCURRENTLY ─────────────────────────
         tier1_res, tier2_res = await asyncio.gather(
             self._tier1(ir, message, entities, eff_budget),
@@ -545,13 +556,11 @@ class MemoryRouter:
             raw_backup = await self._backup(report, entities)
             backup = [dict(m, _coverage_source=True) for m in raw_backup]
 
-        # ── 4b. Emotional baseline (fire concurrently in background) ──────────
+        # ── 4b. Collect emotional baseline result (already running) ───────────
         emotional_baseline: Dict = {}
-        if ir.primary_intent == Intent.EMOTIONAL:
+        if emotional_baseline_task is not None:
             try:
-                emotional_baseline = await self._engine.get_emotions_summary(
-                    topic=entities[0] if entities else None
-                )
+                emotional_baseline = await emotional_baseline_task
             except Exception as exc:
                 observer.warning("emotional baseline failed", error=str(exc))
 

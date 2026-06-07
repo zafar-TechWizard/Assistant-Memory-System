@@ -163,7 +163,24 @@ class MemoryManager:
         )
         self._watcher.start()
 
-        self.is_initialized = True
+        # 7. End-to-end pipeline warmup
+        # Drive one benign message through the full observe -> reactive_processing
+        # -> router -> rerank path so GLiNER, the cross-encoder, and the first
+        # Neo4j round-trip all pay their cold-start cost here instead of on the
+        # user's first message. Without this the very first observe() consumes
+        # 800-1500ms of JIT/connection-warm overhead and times out the wait.
+        self.is_initialized = True  # set early so observe() doesn't refuse
+        try:
+            self.working_memory._processing_done.clear()
+            await _warmup_loop.run_in_executor(
+                None,
+                self.working_memory.reactive_processing,
+                "system",
+                "warmup",
+            )
+        except Exception as exc:
+            observer.warning("end-to-end warmup failed (non-fatal)", error=str(exc))
+
         observer.info("MemoryManager.setup complete")
 
     # =========================================================================
@@ -181,6 +198,12 @@ class MemoryManager:
 
         if role == "user" and self._watcher:
             self._watcher.record_user_activity()
+
+        # Clear the "processing done" event in the caller's thread BEFORE
+        # dispatching to the executor. Otherwise a get_context() racing the
+        # executor's scheduling latency returns instantly (event still set
+        # from the previous turn / startup), surfacing empty state.
+        self.working_memory._processing_done.clear()
 
         loop = asyncio.get_running_loop()
         loop.run_in_executor(
@@ -200,9 +223,34 @@ class MemoryManager:
 
         Blocks for at most `context_retrieval_timeout_ms` milliseconds waiting
         for in-flight reactive_processing to complete, then returns the state.
+
+        SAFE to call from sync code. From async code use `get_context_async`
+        instead — otherwise the threading.Event.wait inside freezes the event
+        loop and starves the bridged Neo4j calls that reactive_processing
+        scheduled, making this method return empty state every time.
         """
         self._require_initialized()
         return self.working_memory.get_working_context(role, message)
+
+    async def get_context_async(
+        self, role: str = "", message: str = ""
+    ) -> Dict[str, Any]:
+        """
+        Async-friendly variant of get_context.
+
+        Performs the blocking wait inside a thread executor so the event loop
+        stays free to service the bridged coroutines (router.route, Neo4j
+        queries) that reactive_processing scheduled via
+        asyncio.run_coroutine_threadsafe.
+
+        Use this from async code (brain.py, sofi.py). get_context (sync) is
+        kept for callers that genuinely run from a non-async thread.
+        """
+        self._require_initialized()
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None, self.working_memory.get_working_context, role, message
+        )
 
     def get_full_context(self):
         """Return the full WorkingContext dataclass snapshot — all four pillars."""

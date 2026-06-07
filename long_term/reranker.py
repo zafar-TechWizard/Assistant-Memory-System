@@ -14,13 +14,21 @@ _model = None  # CrossEncoder singleton — loaded lazily at startup
 
 
 def load_reranker() -> None:
-    """Load the cross-encoder. Blocking ~200ms first call; cached after that."""
+    """
+    Load the cross-encoder AND run one throwaway inference so PyTorch's lazy
+    kernel compilation happens during setup, not on the user's first message.
+
+    Without the dummy predict() below, the first real rerank pays a ~200ms
+    JIT cost on top of normal inference time — verified empirically.
+    """
     global _model
     if _model is not None:
         return
     try:
         from sentence_transformers import CrossEncoder
         _model = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
+        # Warm the kernels so the first real call lands at steady-state.
+        _model.predict([("warmup", "warmup")])
         observer.info("cross-encoder reranker loaded", model="ms-marco-MiniLM-L-6-v2")
     except ImportError:
         observer.warning("sentence-transformers not installed — reranker disabled")

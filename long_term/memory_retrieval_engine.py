@@ -15,6 +15,7 @@ Features:
 - Connection reinforcement
 """
 
+import asyncio
 import math
 from typing import List, Dict, Any, Optional
 from datetime import datetime, timedelta
@@ -1149,22 +1150,24 @@ class MemoryRetrievalEngine:
             max(abs(coalesce(m.emotional_tone, 0.0))) as max_intensity
         """
         
-        results = await self.client.execute_query(query, parameters)
-        
         # Get most emotional memory
         query_most = f"""
         MATCH (m)
         {topic_filter}
-        RETURN 
+        RETURN
             m.id as id,
             m.content as content,
             m.emotional_tone as emotional_tone
         ORDER BY abs(m.emotional_tone) DESC
         LIMIT 1
         """
-        
-        most_emotional = await self.client.execute_query(query_most, parameters)
-        
+
+        # Two independent aggregations — run them concurrently.
+        results, most_emotional = await asyncio.gather(
+            self.client.execute_query(query, parameters),
+            self.client.execute_query(query_most, parameters),
+        )
+
         summary = results[0] if results else {}
         summary['most_emotional_memory'] = most_emotional[0] if most_emotional else None
         return summary
@@ -1549,25 +1552,27 @@ class MemoryRetrievalEngine:
         """
         Resolve entity strings to Neo4j node IDs via direct property match.
         No embedding — matches person_name, concept, or participants list.
-        Returns up to 3 matching node IDs per entity.
+        Single UNWIND query — one round trip regardless of entity count.
         """
         if not entities:
             return []
 
-        seed_ids: List[str] = []
-        for entity in entities:
-            query = """
-            MATCH (seed)
-            WHERE toLower(coalesce(seed.person_name, "")) = toLower($entity)
-               OR toLower(coalesce(seed.concept, ""))     = toLower($entity)
-               OR any(p IN coalesce(seed.participants, [])
-                      WHERE toLower(p) = toLower($entity))
-            RETURN seed.id AS id
-            LIMIT 3
-            """
-            rows = await self.client.execute_query(query, parameters={"entity": entity})
-            seed_ids.extend(r["id"] for r in rows if r.get("id"))
-        return seed_ids
+        query = """
+        UNWIND $entities AS entity
+        WITH toLower(entity) AS e
+        MATCH (seed)
+        WHERE toLower(coalesce(seed.person_name, "")) = e
+           OR toLower(coalesce(seed.concept, ""))     = e
+           OR any(p IN coalesce(seed.participants, [])
+                  WHERE toLower(p) = e)
+        WITH e, collect(DISTINCT seed.id)[..3] AS ids
+        UNWIND ids AS id
+        RETURN id
+        """
+        rows = await self.client.execute_query(
+            query, parameters={"entities": entities}
+        )
+        return [r["id"] for r in rows if r.get("id")]
 
     @staticmethod
     def _escape_lucene(term: str) -> str:
