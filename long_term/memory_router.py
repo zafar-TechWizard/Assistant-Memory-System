@@ -680,13 +680,19 @@ class MemoryRouter:
         if intent == Intent.FACTUAL:
             # Semantic search is intentionally NOT used on the hot path —
             # embedding compute stays at consolidation time only. BM25 covers
-            # this intent at zero embedding cost. The content_vector field is
-            # still populated on every node for offline analysis later.
+            # this intent at zero embedding cost.
             if entities:
                 return await eng.bm25_search(query_terms=entities, limit=budget)
-            # No entities + no semantic fallback. Coverage check + Tier 2 may
-            # still find something. If real usage shows this gap matters, add
-            # a keyword-based BM25 fallback then — with actual failure cases.
+            # FACTUAL with no extracted entities — fall back to BM25 on the
+            # longer words in the message. No stop-word list (those are
+            # opinionated and brittle); just length-filter. Lucene scores
+            # short common words near zero anyway.
+            keywords = [
+                w.strip(",.!?;:'\"()") for w in message.split()
+                if len(w.strip(",.!?;:'\"()")) >= 5
+            ][:5]
+            if keywords:
+                return await eng.bm25_search(query_terms=keywords, limit=budget)
             return []
 
         if intent == Intent.EMOTIONAL:

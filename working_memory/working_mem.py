@@ -272,6 +272,7 @@ class WorkingMemory:
                 }, ms=(time.perf_counter() - t_intent) * 1000)
 
             # ── 5. LTM retrieval — router or fallback ─────────────────────────
+            routed = None  # captured so we can update context_manager outside the branch
             if _non_ambient and self._loop:
                 entities_list = list(entities)
                 _intent_val = _ir.primary_intent.value
@@ -321,40 +322,6 @@ class WorkingMemory:
                             }
                             self._state["emotional_baseline"] = routed.emotional_baseline
 
-                        # ── Push into WorkingContextManager (central state doc) ──
-                        if self._ctx_mgr:
-                            raw_turns = self.conversation_logger.get_conversation_history(
-                                max_turns=config.working_context_recent_turns * 2
-                            )
-                            recent_turns = [
-                                ConversationTurn(
-                                    role=t["role"],
-                                    content=t["content"],
-                                    timestamp=datetime.fromisoformat(
-                                        t["timestamp"].replace("Z", "")
-                                    ),
-                                )
-                                for t in raw_turns[-config.working_context_recent_turns:]
-                            ]
-                            self._ctx_mgr.update_memory(
-                                must_know=routed.must_know,
-                                context=routed.context,
-                                associations=routed.associations,
-                                recent_turns=recent_turns,
-                                retrieval_meta={
-                                    "intent":        routed.intent.value,
-                                    "confidence":    routed.confidence,
-                                    "signals_fired": routed.signals_fired,
-                                    "latency_ms":    routed.latency_ms,
-                                },
-                                emotional_baseline=routed.emotional_baseline,
-                            )
-                            focus_entities = list(entities) if entities else list(new_entities)
-                            self._ctx_mgr.update_user_state(
-                                mentioned_entities=focus_entities,
-                                current_focus=", ".join(focus_entities[:3]),
-                            )
-
                         observer.stage("router_result", {
                             "intent":          routed.intent.value,
                             "must_know_count": len(routed.must_know),
@@ -386,8 +353,60 @@ class WorkingMemory:
                         self._state["memories"], fetched
                     )
 
-            # ── Fire-and-forget: log conversation + persist state ────────────
-            self._executor.submit(self._safe_log, role, content)
+            # ── 6. Log conversation SYNCHRONOUSLY before reading back ─────────
+            # Logging used to be fire-and-forget at the very end, which raced
+            # with the recent_turns read below — the current turn often hadn't
+            # been written to disk yet. Logging here (after retrieval, before
+            # the WorkingContext update) is the simplest reliable fix.
+            self._safe_log(role, content)
+
+            # ── 7. ALWAYS push to WorkingContextManager (regardless of intent path) ──
+            # This is what populates WorkingContext.memory.recent_turns. Used to
+            # live inside the `if routed is not None:` branch, which meant
+            # AMBIENT / familiarity-hit / router-timeout turns never refreshed
+            # the conversation history surfaced to the brain layer.
+            if self._ctx_mgr:
+                try:
+                    raw_turns = self.conversation_logger.get_conversation_history(
+                        max_turns=config.working_context_recent_turns * 2
+                    )
+                    recent_turns = [
+                        ConversationTurn(
+                            role=t["role"],
+                            content=t["content"],
+                            timestamp=datetime.fromisoformat(
+                                t["timestamp"].replace("Z", "")
+                            ),
+                        )
+                        for t in (raw_turns or [])[-config.working_context_recent_turns:]
+                    ]
+                except Exception as exc:
+                    observer.warning("recent_turns read failed", error=str(exc))
+                    recent_turns = []
+
+                update_kwargs: Dict[str, Any] = {"recent_turns": recent_turns}
+                if routed is not None:
+                    update_kwargs.update({
+                        "must_know":          routed.must_know,
+                        "context":            routed.context,
+                        "associations":       routed.associations,
+                        "retrieval_meta": {
+                            "intent":        routed.intent.value,
+                            "confidence":    routed.confidence,
+                            "signals_fired": routed.signals_fired,
+                            "latency_ms":    routed.latency_ms,
+                        },
+                        "emotional_baseline": routed.emotional_baseline,
+                    })
+                self._ctx_mgr.update_memory(**update_kwargs)
+
+                focus_entities = list(entities) if entities else list(new_entities)
+                self._ctx_mgr.update_user_state(
+                    mentioned_entities=focus_entities,
+                    current_focus=", ".join(focus_entities[:3]) if focus_entities else "",
+                )
+
+            # ── 8. Persist state in background (disk write, not on hot path) ──
             self._executor.submit(self._persist_state)
 
             elapsed = (time.perf_counter() - t0) * 1000

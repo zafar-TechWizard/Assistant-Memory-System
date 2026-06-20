@@ -56,7 +56,12 @@ class MemoryConfig:
     # Working Memory
     # -------------------------------------------------------------------------
     entity_expiry_minutes: int = 15
-    context_retrieval_timeout_ms: int = 300   # hard cap for get_context()
+    context_retrieval_timeout_ms: int = 1500  # hard cap for get_context()
+    # Why 1500ms: warm-state retrieval is 110-270ms, but the FIRST call after
+    # setup pays cold-start cost for cross-encoder JIT (~200ms), Neo4j first
+    # query plan (~150ms) and entity extractor warm-up (~200-400ms). Hard cap
+    # must accommodate the cold path, not just the warm path. The router itself
+    # gets 80% of this. (Verified empirically via L3 end-to-end test.)
     max_memories_per_entity: int = 5
     max_total_memories: int = 50              # cap on whiteboard memory list
     enable_auto_cleanup: bool = True
