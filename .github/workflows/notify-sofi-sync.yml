@@ -1,0 +1,19 @@
+name: Notify SOFI on prod push
+
+# Whenever memory's prod branch gets a push, trigger SOFI to
+# update its submodule pointer to the latest prod commit.
+on:
+  push:
+    branches: [prod]
+
+jobs:
+  trigger-sofi-sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Trigger SOFI submodule sync
+        uses: peter-evans/repository-dispatch@v3
+        with:
+          token: ${{ secrets.SOFI_SYNC_TOKEN }}
+          repository: zafar-TechWizard/SOFI
+          event-type: memory-updated
