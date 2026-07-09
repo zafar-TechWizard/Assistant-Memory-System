@@ -26,11 +26,14 @@ Writers
   [future] EmotionalModule → writes SofiState.emotional_tone + UserState.current_emotional_state
 """
 
+import json
 import threading
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 from memory.config import config
@@ -115,6 +118,11 @@ class SofiState:
     current_datetime: str = ""   # ISO 8601
     timezone: str         = ""
     time_of_day: str      = ""   # morning | afternoon | evening | night
+
+    # Response analysis (updated post-response by ResponseAnalyzer — fire-and-forget)
+    last_topics_discussed: List[str] = field(default_factory=list)
+    last_commitments:      List[str] = field(default_factory=list)
+    last_questions_asked:  List[str] = field(default_factory=list)
 
 
 # =============================================================================
@@ -201,17 +209,81 @@ class WorkspaceItem:
     metadata: Dict[str, Any]       = field(default_factory=dict)
 
 
+# =============================================================================
+# SERIALIZATION HELPERS  (module-level so they can be used in AgenticWorkspace)
+# =============================================================================
+
+def _item_to_dict(item: "WorkspaceItem") -> Dict[str, Any]:
+    """Serialise a WorkspaceItem to a JSON-safe dict."""
+    return {
+        "id":              item.id,
+        "type":            item.type.value,
+        "title":           item.title,
+        "description":     item.description,
+        "status":          item.status.value,
+        "progress":        item.progress,
+        "notify":          item.notify,
+        "notify_priority": item.notify_priority.value,
+        "due_at":          item.due_at.isoformat() if item.due_at else None,
+        "created_at":      item.created_at.isoformat(),
+        "updated_at":      item.updated_at.isoformat(),
+        "source_agent":    item.source_agent,
+        "metadata":        item.metadata,
+    }
+
+
+def _dict_to_item(d: Dict[str, Any]) -> "WorkspaceItem":
+    """Reconstruct a WorkspaceItem from a dict (inverse of _item_to_dict)."""
+    def _dt(val: Any) -> Optional[datetime]:
+        return datetime.fromisoformat(val) if val else None
+
+    return WorkspaceItem(
+        id              = d.get("id") or str(uuid.uuid4()),
+        type            = WorkspaceItemType(d.get("type", "task")),
+        title           = d.get("title", ""),
+        description     = d.get("description", ""),
+        status          = WorkspaceItemStatus(d.get("status", "pending")),
+        progress        = float(d.get("progress", 0.0)),
+        notify          = bool(d.get("notify", False)),
+        notify_priority = NotifyPriority(d.get("notify_priority", "normal")),
+        due_at          = _dt(d.get("due_at")),
+        created_at      = _dt(d.get("created_at")) or datetime.now(),
+        updated_at      = _dt(d.get("updated_at")) or datetime.now(),
+        source_agent    = d.get("source_agent", ""),
+        metadata        = d.get("metadata") or {},
+    )
+
+
+# =============================================================================
+# PILLAR 4 — AGENTIC WORKSPACE  (disk-backed)
+# =============================================================================
+
 class AgenticWorkspace:
     """
-    Thread-safe collection of WorkspaceItems.
+    Thread-safe collection of WorkspaceItems with optional disk persistence.
 
     Multiple sub-agents can write concurrently. The WorkspaceWatcher reads
-    concurrently. All operations are protected by a single internal RLock.
+    concurrently. All write operations are protected by a single internal RLock.
+
+    Persistence
+    -----------
+    Pass persist_path to the constructor to enable disk persistence.
+    Items are saved automatically after every mutation (atomic write via
+    tmp-file + rename).  On startup, items from the previous session are
+    restored — only PENDING and IN_PROGRESS items are reloaded so completed
+    tasks don't clutter the workspace after a restart.
+
+    A write failure never crashes a mutation — it is logged as a warning
+    and the in-memory state remains authoritative.
     """
 
-    def __init__(self) -> None:
-        self._lock: threading.RLock = threading.RLock()
+    def __init__(self, persist_path: Optional[Path] = None) -> None:
+        self._lock: threading.RLock     = threading.RLock()
         self._items: List[WorkspaceItem] = []
+        self._persist_path: Optional[Path] = persist_path
+
+        if persist_path is not None:
+            self._load_from_disk()
 
     # ── Write ─────────────────────────────────────────────────────────────────
 
@@ -219,7 +291,8 @@ class AgenticWorkspace:
         """Add a new item. Returns its id."""
         with self._lock:
             self._items.append(item)
-            return item.id
+        self._persist()
+        return item.id
 
     def update_item(self, item_id: str, **kwargs) -> bool:
         """
@@ -227,6 +300,7 @@ class AgenticWorkspace:
         Always updates `updated_at` automatically.
         Returns True if found and updated, False if not found.
         """
+        found = False
         with self._lock:
             for item in self._items:
                 if item.id == item_id:
@@ -236,15 +310,21 @@ class AgenticWorkspace:
                         else:
                             observer.warning("workspace unknown field", field=key)
                     item.updated_at = datetime.now()
-                    return True
-            return False
+                    found = True
+                    break
+        if found:
+            self._persist()
+        return found
 
     def remove_item(self, item_id: str) -> bool:
         """Remove an item by id. Returns True if removed."""
         with self._lock:
             before = len(self._items)
             self._items = [i for i in self._items if i.id != item_id]
-            return len(self._items) < before
+            removed = len(self._items) < before
+        if removed:
+            self._persist()
+        return removed
 
     # ── Read (return copies to avoid external mutation) ───────────────────────
 
@@ -281,6 +361,14 @@ class AgenticWorkspace:
                 and (i.due_at - now).total_seconds() <= within_seconds
             ]
 
+    def get_by_id(self, item_id: str) -> Optional[WorkspaceItem]:
+        """Return the WorkspaceItem with the given id, or None if not found."""
+        with self._lock:
+            for item in self._items:
+                if item.id == item_id:
+                    return item
+            return None
+
     def get_by_type(self, item_type: WorkspaceItemType) -> List[WorkspaceItem]:
         with self._lock:
             return [i for i in self._items if i.type == item_type]
@@ -288,23 +376,83 @@ class AgenticWorkspace:
     def snapshot(self) -> List[Dict]:
         """Return a serialisable snapshot of all items (no lock held by caller)."""
         with self._lock:
-            return [
-                {
-                    "id":           i.id,
-                    "type":         i.type.value,
-                    "title":        i.title,
-                    "description":  i.description,
-                    "status":       i.status.value,
-                    "progress":     i.progress,
-                    "notify":       i.notify,
-                    "notify_priority": i.notify_priority.value,
-                    "due_at":       i.due_at.isoformat() if i.due_at else None,
-                    "source_agent": i.source_agent,
-                    "updated_at":   i.updated_at.isoformat(),
-                    "metadata":     i.metadata,
-                }
-                for i in self._items
-            ]
+            return [_item_to_dict(i) for i in self._items]
+
+    # ── Persistence ───────────────────────────────────────────────────────────
+
+    def _persist(self) -> None:
+        """
+        Write all items to disk atomically (tmp + rename).
+
+        Never raises — a disk failure is logged and the in-memory state
+        remains authoritative.  Called after every successful mutation.
+        """
+        if self._persist_path is None:
+            return
+        try:
+            data = {
+                "_saved_at": datetime.now().isoformat(),
+                "items":     self.snapshot(),
+            }
+            tmp = self._persist_path.with_suffix(".json.tmp")
+            self._persist_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(data, fh, indent=2, ensure_ascii=False)
+            tmp.replace(self._persist_path)
+        except Exception as exc:
+            observer.warning(
+                "AgenticWorkspace persist failed",
+                path=str(self._persist_path),
+                error=str(exc),
+            )
+
+    def _load_from_disk(self) -> None:
+        """
+        Restore workspace items from the previous session.
+
+        Only PENDING and IN_PROGRESS items are restored — completed, failed,
+        and handled items are not reloaded so the workspace starts clean.
+        A corrupt or missing file is silently ignored (fresh start).
+        """
+        if self._persist_path is None or not self._persist_path.exists():
+            return
+        try:
+            with open(self._persist_path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+
+            _active_statuses = {
+                WorkspaceItemStatus.PENDING.value,
+                WorkspaceItemStatus.IN_PROGRESS.value,
+                WorkspaceItemStatus.BLOCKED.value,
+            }
+            loaded: List[WorkspaceItem] = []
+            for d in data.get("items", []):
+                if d.get("status") not in _active_statuses:
+                    continue
+                try:
+                    loaded.append(_dict_to_item(d))
+                except Exception as item_exc:
+                    observer.warning(
+                        "AgenticWorkspace item deserialization failed",
+                        item_id=d.get("id"),
+                        error=str(item_exc),
+                    )
+
+            with self._lock:
+                self._items = loaded
+
+            if loaded:
+                observer.info(
+                    "AgenticWorkspace restored from disk",
+                    count=len(loaded),
+                    path=str(self._persist_path),
+                )
+        except Exception as exc:
+            observer.warning(
+                "AgenticWorkspace load failed — starting fresh",
+                path=str(self._persist_path),
+                error=str(exc),
+            )
 
 
 # =============================================================================
@@ -339,12 +487,23 @@ class WorkingContextManager:
       working_mem.py      → update_memory()
       entity extractor    → update_user_state(mentioned_entities=...)
       background timer    → update_sofi_state(current_datetime=...)
-      [future] emotional  → update_sofi_state(emotional_tone=...)
-                            update_user_state(current_emotional_state=...)
+      user_state_inferencer → update_user_state(...)
+      response_analyzer   → update_sofi_response_state(...)
       sub-agents          → workspace.add_item() / workspace.update_item()
+
+    Disk persistence (Phase 4):
+      update_sofi_state() and update_user_state() fire-and-forget their
+      sections to working_context.json via DiskContextManager.save_section().
+      The executor (1 worker) serialises writes without blocking callers.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, disk_ctx=None) -> None:
+        """
+        Args:
+            disk_ctx: Optional DiskContextManager instance. If None, one is
+                      created automatically using config.context_file_path.
+                      Pass one explicitly to share the instance with WorkingMemory.
+        """
         self._lock = threading.RLock()
 
         # Initialise all four pillars
@@ -356,7 +515,24 @@ class WorkingContextManager:
             user_id=config.user_id,
             name=config.user_id,
         )
-        self._workspace = AgenticWorkspace()   # has its own internal lock
+
+        # AgenticWorkspace — disk-backed so task state survives session restarts.
+        # Placed in the same data directory as the working context file.
+        _tasks_path = config.context_file_path.parent / "agentic_tasks.json"
+        self._workspace = AgenticWorkspace(persist_path=_tasks_path)
+
+        # Disk persistence: use injected DiskContextManager or create one.
+        # Import lazily to avoid circular import (context_manager → working_context).
+        if disk_ctx is not None:
+            self._disk: Any = disk_ctx
+        else:
+            from memory.working_memory.context_manager import WorkingContextManager as _DiskCM
+            self._disk = _DiskCM(config.context_file_path)
+
+        # 1-worker executor: serialises async section writes without blocking callers.
+        self._persist_exec = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="SOFiWCPersist"
+        )
 
         # Kick off the background datetime timer immediately
         self._start_datetime_timer()
@@ -398,7 +574,7 @@ class WorkingContextManager:
 
     def update_sofi_state(self, **kwargs) -> None:
         """
-        Update any field(s) on SofiState.
+        Update any field(s) on SofiState and fire-and-forget disk persist.
         e.g. update_sofi_state(emotional_tone="concerned", current_mode="empathetic")
         """
         with self._lock:
@@ -407,12 +583,42 @@ class WorkingContextManager:
                     setattr(self._sofi, key, value)
                 else:
                     observer.warning("unknown SofiState field", field=key)
+            sofi_snapshot = self._build_sofi_section()
+
+        self._persist_exec.submit(
+            self._disk.save_section, "sofi", sofi_snapshot, "sofi_state"
+        )
+
+    # ── SOFi response-analysis update ────────────────────────────────────────
+
+    def update_sofi_response_state(
+        self,
+        last_topics_discussed: Optional[List[str]] = None,
+        last_commitments:      Optional[List[str]] = None,
+        last_questions_asked:  Optional[List[str]] = None,
+    ) -> None:
+        """
+        Update the three post-response analysis fields on SofiState and persist.
+        Called fire-and-forget after each assistant turn.
+        """
+        with self._lock:
+            if last_topics_discussed is not None:
+                self._sofi.last_topics_discussed = last_topics_discussed
+            if last_commitments is not None:
+                self._sofi.last_commitments = last_commitments
+            if last_questions_asked is not None:
+                self._sofi.last_questions_asked = last_questions_asked
+            sofi_snapshot = self._build_sofi_section()
+
+        self._persist_exec.submit(
+            self._disk.save_section, "sofi", sofi_snapshot, "response_analyzer"
+        )
 
     # ── User section update ───────────────────────────────────────────────────
 
     def update_user_state(self, **kwargs) -> None:
         """
-        Update any field(s) on UserState.
+        Update any field(s) on UserState and fire-and-forget disk persist.
         e.g. update_user_state(mentioned_entities=["Alice", "project"])
         """
         with self._lock:
@@ -421,6 +627,11 @@ class WorkingContextManager:
                     setattr(self._user, key, value)
                 else:
                     observer.warning("unknown UserState field", field=key)
+            user_snapshot = self._build_user_section()
+
+        self._persist_exec.submit(
+            self._disk.save_section, "user", user_snapshot, "user_state_inferencer"
+        )
 
     # ── Workspace access (direct reference — has its own lock) ────────────────
 
@@ -462,6 +673,68 @@ class WorkingContextManager:
         with self._lock:
             from copy import deepcopy
             return deepcopy(self._user)
+
+    # ── Section serialisers (convert in-memory dataclasses → schema-v2 dicts) ──
+
+    def _build_sofi_section(self) -> Dict[str, Any]:
+        """Build the schema-v2 'sofi' section from live SofiState. Lock must be held."""
+        s = self._sofi
+        return {
+            "_v":               0,   # incremented by save_section
+            "_owner":           "response_analyzer",
+            "_updated_at":      "",  # set by save_section
+            "mode":             s.current_mode,
+            "energy_level":     s.energy_level,
+            "emotional_tone":   s.emotional_tone,
+            "current_focus":    s.current_focus,
+            "last_topics":      list(s.last_topics_discussed),
+            "last_commitments": list(s.last_commitments),
+            "last_questions":   list(s.last_questions_asked),
+            "current_datetime": s.current_datetime,
+            "timezone":         s.timezone,
+            "time_of_day":      s.time_of_day,
+        }
+
+    def _build_user_section(self) -> Dict[str, Any]:
+        """Build the schema-v2 'user' section from live UserState. Lock must be held."""
+        u = self._user
+        return {
+            "_v":                  0,   # incremented by save_section
+            "_owner":              "user_state_inferencer",
+            "_updated_at":         "",  # set by save_section
+            "emotional_state":     u.current_emotional_state,
+            "emotional_intensity": u.emotional_intensity,
+            "need":                u.current_need,
+            "engagement_level":    u.engagement_level,
+            "current_focus":       u.current_focus,
+            "mentioned_entities":  list(u.mentioned_entities),
+            "sentiment":           u.last_message_sentiment,
+        }
+
+    def save_capabilities(self, caps: Dict[str, Any], updated_by: str = "self_model") -> None:
+        """
+        Persist the capabilities section to working_context.json (fire-and-forget).
+        `caps` maps capability_name → {installed: bool, available: bool, ...}
+        """
+        self._persist_exec.submit(
+            self._disk.save_capabilities, caps, updated_by
+        )
+
+    def append_wc_event(self, event_type: str, payload: Dict[str, Any]) -> None:
+        """
+        Append one event to the working_context event ring (fire-and-forget).
+        Use EventType constants from wc_schema for event_type strings.
+        """
+        self._persist_exec.submit(
+            self._disk.append_event, event_type, payload
+        )
+
+    def shutdown(self) -> None:
+        """Flush pending disk writes and shut down the persistence executor."""
+        try:
+            self._persist_exec.shutdown(wait=True, cancel_futures=False)
+        except Exception as exc:
+            observer.warning("WorkingContextManager shutdown failed", error=str(exc))
 
     # ── Background: environmental datetime timer ──────────────────────────────
 

@@ -43,9 +43,9 @@ class MemoryConfig:
     neo4j_bolt_port: int = 7687
 
     # Docker / Health Check
-    neo4j_health_check_max_attempts: int = 12
-    neo4j_health_check_interval: int = 5   # seconds between poll attempts
-    neo4j_post_start_wait: int = 10        # extra seconds after "Started" message
+    neo4j_health_check_max_attempts: int = 60
+    neo4j_health_check_interval: int = 1   # seconds between poll attempts
+    neo4j_post_start_wait: int = 2        # extra seconds after "Started" message
 
     # -------------------------------------------------------------------------
     # Embedding
@@ -81,14 +81,26 @@ class MemoryConfig:
     # -------------------------------------------------------------------------
     # Derived Paths
     #
-    # CODE lives at:    <project>/memory/                  (this file's directory)
-    # DATA lives at:    <project>/BRAIN/memory/data/       (operational state)
+    # Directory layout:
     #
-    # All runtime artifacts (Neo4j graph files, conversation log, working
-    # context, logs, review traces, dry-run plans) live under BRAIN/memory/
-    # so the brain layer owns operational state cleanly while the code stays
-    # in its own package.
+    #   BRAIN/runtime/          ← brain's operational state (session data, logs, tasks)
+    #     session/              ← per-session JSON state files
+    #       conversation.json
+    #       working_context.json
+    #       agentic_tasks.json  (derived from context_file_path.parent)
+    #     tasks/                ← delegate task records
+    #     logs/                 ← daily logs + metrics
+    #       metrics/
+    #
+    #   BRAIN/memory/data/      ← memory system's learning data (Neo4j, tiers, reviews)
+    #     neo4j/                ← Docker-mounted Neo4j data
+    #     memory/tiers/         ← memory tier snapshots
+    #     consolidation_dry_runs/
+    #     reviews/
+    #
+    # CODE lives at: <project>/memory/  (this file's directory)
     # -------------------------------------------------------------------------
+
     @property
     def _memory_root(self) -> Path:
         """Absolute path to the memory/ source-code package directory."""
@@ -99,32 +111,61 @@ class MemoryConfig:
         """Absolute path to the project root (parent of memory/)."""
         return self._memory_root.parent
 
+    # ── Runtime root (brain's operational state) ───────────────────────────
+
+    @property
+    def runtime_dir(self) -> Path:
+        """<project>/BRAIN/runtime/ — all brain operational state."""
+        p = self._project_root / "BRAIN" / "runtime"
+        p.mkdir(parents=True, exist_ok=True)
+        return p
+
+    @property
+    def session_dir(self) -> Path:
+        """<project>/BRAIN/runtime/session/ — per-session JSON state files."""
+        p = self.runtime_dir / "session"
+        p.mkdir(parents=True, exist_ok=True)
+        return p
+
+    @property
+    def conversation_log_path(self) -> Path:
+        """<project>/BRAIN/runtime/session/conversation.json"""
+        return self.session_dir / "conversation.json"
+
+    @property
+    def context_file_path(self) -> Path:
+        """<project>/BRAIN/runtime/session/working_context.json"""
+        return self.session_dir / "working_context.json"
+
+    @property
+    def tasks_dir(self) -> Path:
+        """<project>/BRAIN/runtime/tasks/ — delegate task record files."""
+        p = self.runtime_dir / "tasks"
+        p.mkdir(parents=True, exist_ok=True)
+        return p
+
+    @property
+    def logs_dir(self) -> Path:
+        """<project>/BRAIN/runtime/logs/ — daily logs + metrics."""
+        p = self.runtime_dir / "logs"
+        p.mkdir(parents=True, exist_ok=True)
+        return p
+
+    # ── Memory system data (learning data — stays separate from runtime) ───
+
     @property
     def brain_dir(self) -> Path:
-        """
-        Absolute path to <project>/BRAIN/memory/.
-        All operational runtime data lives under this directory.
-        """
+        """<project>/BRAIN/memory/ — memory system root (legacy alias)."""
         p = self._project_root / "BRAIN" / "memory"
         p.mkdir(parents=True, exist_ok=True)
         return p
 
     @property
     def data_dir(self) -> Path:
-        """<project>/BRAIN/memory/data/ — created on first access."""
+        """<project>/BRAIN/memory/data/ — memory system's learning data."""
         p = self.brain_dir / "data"
         p.mkdir(parents=True, exist_ok=True)
         return p
-
-    @property
-    def conversation_log_path(self) -> Path:
-        """<project>/BRAIN/memory/data/conversation.json"""
-        return self.data_dir / "conversation.json"
-
-    @property
-    def context_file_path(self) -> Path:
-        """<project>/BRAIN/memory/data/working_context.json"""
-        return self.data_dir / "working_context.json"
 
     @property
     def neo4j_data_path(self) -> str:
@@ -135,13 +176,6 @@ class MemoryConfig:
         p = self.data_dir / "neo4j"
         p.mkdir(parents=True, exist_ok=True)
         return str(p)
-
-    @property
-    def logs_dir(self) -> Path:
-        """<project>/BRAIN/memory/data/logs/ — observer log files."""
-        p = self.data_dir / "logs"
-        p.mkdir(parents=True, exist_ok=True)
-        return p
 
     @property
     def reviews_dir(self) -> Path:
@@ -171,15 +205,18 @@ class MemoryConfig:
         at startup so missing directories surface immediately rather than
         deep inside a writer that assumes its target exists.
 
-        Returns a dict mapping logical names → resolved paths. Useful for
-        confirming exactly what got created (the runner prints this).
+        Returns a dict mapping logical names → resolved paths.
         """
         # Accessing each property triggers its own mkdir(parents=True, exist_ok=True)
         return {
-            "brain_dir":                  self.brain_dir,
+            # Runtime (brain operational state)
+            "runtime_dir":                self.runtime_dir,
+            "session_dir":                self.session_dir,
+            "tasks_dir":                  self.tasks_dir,
+            "logs_dir":                   self.logs_dir,
+            # Memory system learning data
             "data_dir":                   self.data_dir,
             "neo4j_data_path":            Path(self.neo4j_data_path),
-            "logs_dir":                   self.logs_dir,
             "reviews_dir":                self.reviews_dir,
             "consolidation_dry_runs_dir": self.consolidation_dry_runs_dir,
         }

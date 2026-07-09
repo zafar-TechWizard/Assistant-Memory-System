@@ -47,6 +47,7 @@ from typing import Any, Dict, List, Optional, Set
 from memory.config import config
 # Renamed to avoid collision with the new centralized WorkingContextManager
 from memory.working_memory.context_manager import WorkingContextManager as DiskContextManager
+from memory.working_memory.ref_resolver import RefResolver
 from memory.working_memory.working_context import (
     WorkingContextManager,
     ConversationTurn,
@@ -143,6 +144,8 @@ class WorkingMemory:
         cfg_file = context_file or config.context_file_path
         cfg_file.parent.mkdir(parents=True, exist_ok=True)
         self._disk_ctx = DiskContextManager(cfg_file)  # disk persistence only
+        # RefResolver handles all sidecar $ref I/O (context/assoc tiers, traces)
+        self._ref_resolver = RefResolver(context_dir=cfg_file.parent)
         self._restore_from_disk()
 
         # ── Supporting Components ─────────────────────────────────────────────
@@ -717,16 +720,61 @@ class WorkingMemory:
             observer.warning("state restore failed", error=str(exc))
 
     def _persist_state(self) -> None:
-        """Snapshot current state to disk (runs in executor thread)."""
+        """
+        Snapshot current state to the full schema-v2 memory section.
+
+        Runs in executor thread (fire-and-forget from reactive_processing).
+        Large tiers (context, associations) go to sidecar files via RefResolver;
+        small/hot data (active_entities, current_entities, must_know) is inline.
+        """
         try:
             with self._state_lock:
-                snapshot = {
-                    "active_entities": dict(self._state["active_entities"]),
-                    "current_entities": list(self._state["current_entities"]),
-                    "memories": list(self._state["memories"]),
-                    "_persisted_at": datetime.now().isoformat(),
-                }
-            self._disk_ctx.save(snapshot)
+                active_entities  = dict(self._state["active_entities"])
+                current_entities = list(self._state["current_entities"])
+                must_know        = list(self._state["tiered_memories"]["must_know"])
+                context_items    = list(self._state["tiered_memories"]["context"])
+                assoc_items      = list(self._state["tiered_memories"]["associations"])
+                retrieval_meta   = dict(self._state["retrieval_meta"])
+                emotional_base   = dict(self._state["emotional_baseline"])
+
+            # Write large tiers to sidecar files (always, even if empty —
+            # so the $ref is always a valid pointer and readers never KeyError).
+            context_ref = self._ref_resolver.write(
+                context_items, "memory/tiers/context_tier.json"
+            )
+            assoc_ref = self._ref_resolver.write(
+                assoc_items, "memory/tiers/assoc_tier.json"
+            )
+
+            memory_section = {
+                "_v":                0,   # incremented by save_section
+                "_owner":            "working_mem",
+                "_updated_at":       "",  # set by save_section
+                "intent":            retrieval_meta.get("intent") or "unknown",
+                "intent_confidence": retrieval_meta.get("confidence", 0.0),
+                "retrieval_ms":      retrieval_meta.get("latency_ms", 0.0),
+                "signals_fired":     retrieval_meta.get("signals_fired", []),
+                "active_entities":   active_entities,
+                "current_entities":  current_entities,
+                "emotional_baseline":emotional_base,
+                "tiers": {
+                    "must_know": {
+                        "count": len(must_know),
+                        "items": must_know,       # INLINE — always small
+                    },
+                    "context": {
+                        "count": len(context_items),
+                        "$ref":  context_ref,     # → memory/tiers/context_tier.json
+                    },
+                    "associations": {
+                        "count": len(assoc_items),
+                        "$ref":  assoc_ref,       # → memory/tiers/assoc_tier.json
+                    },
+                },
+            }
+
+            self._disk_ctx.save_section("memory", memory_section, updated_by="working_mem")
+
         except Exception as exc:
             observer.warning("disk persist failed", error=str(exc))
 

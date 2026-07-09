@@ -82,51 +82,85 @@ class MemoryManager:
 
         Steps:
           0. Ensure all operational directories exist (BRAIN/memory/data/...)
-          1. Start Docker container for Neo4j (idempotent)
-          2. Connect Neo4j and create schema (indexes + constraints)
-          3. Build embedding utility and retrieval engine
-          4. Build working memory, wired to the retrieval engine
+          1. Run parallel tasks:
+             - Neo4j/Docker startup
+             - Embedding model load & warmup
+             - Reranker model load & warmup
+             - WorkingMemory instantiation (EntityExtractor load)
+          2. Assemble components and start WorkspaceWatcher
+          3. End-to-end warmup
         """
         observer.info("MemoryManager.setup starting")
+        import time
 
         # 0. Ensure operational directories exist before anything else
         dirs = self.config.ensure_directories()
         observer.info("directories ensured", **{k: str(v) for k, v in dirs.items()})
 
-        # 1. Docker / Neo4j health
-        self.docker_manager = DockerManager()
-        try:
-            self.docker_manager.start_docker()
-            await self.docker_manager.ensure_connection_async()
-        except Exception as e:
-            observer.error("Neo4j Docker startup failed", exception=e)
-            raise RuntimeError(
-                f"Neo4j Docker startup failed. "
-                f"Ensure Docker Desktop is running. Detail: {e}"
-            ) from e
+        _loop = asyncio.get_running_loop()
 
-        # 1. Long-Term Memory (L2)
-        self.l2_client = create_neo4j_client(
-            uri=self.config.neo4j_uri,
-            username=self.config.neo4j_username,
-            password=self.config.neo4j_password,
-            database=self.config.database,
-            max_connection_pool_size=30,
+        # Task A: Docker and Neo4j
+        async def _task_neo4j():
+            self.docker_manager = DockerManager()
+            try:
+                self.docker_manager.start_docker()
+                await self.docker_manager.ensure_connection_async()
+            except Exception as e:
+                observer.error("Neo4j Docker startup failed", exception=e)
+                raise RuntimeError(
+                    f"Neo4j Docker startup failed. "
+                    f"Ensure Docker Desktop is running. Detail: {e}"
+                ) from e
+            
+            self.l2_client = create_neo4j_client(
+                uri=self.config.neo4j_uri,
+                username=self.config.neo4j_username,
+                password=self.config.neo4j_password,
+                database=self.config.database,
+                max_connection_pool_size=30,
+            )
+            await self.l2_client.connect()
+            await self.l2_client.create_constraints_and_indexes()
+            await self.l2_client.execute_query("RETURN 1")
+
+        # Task B: Embeddings
+        async def _task_embed():
+            def _load_and_warmup():
+                embed = EmbeddingUtils()
+                embed.generate_embedding("warmup")
+                return embed
+            return await _loop.run_in_executor(None, _load_and_warmup)
+        
+        # Task C: Reranker
+        async def _task_reranker():
+            from memory.long_term import reranker as _reranker_module
+            await _loop.run_in_executor(None, _reranker_module.load_reranker)
+
+        # Task D: WorkingContextManager + WorkingMemory (Instantiates EntityExtractor which takes ~5-10s)
+        async def _task_working_memory():
+            self.context_manager = WorkingContextManager()
+            def _init_working_mem():
+                return WorkingMemory(
+                    user_id=self.config.user_id,
+                    retrieval_engine=None, # wired later
+                    memory_router=None,    # wired later
+                    context_manager=self.context_manager,
+                    event_loop=_loop,
+                )
+            self.working_memory = await _loop.run_in_executor(None, _init_working_mem)
+
+        # 1. Run all heavy loads concurrently
+        _t0 = time.perf_counter()
+        results = await asyncio.gather(
+            _task_neo4j(),
+            _task_embed(),
+            _task_reranker(),
+            _task_working_memory(),
+            return_exceptions=False
         )
-        await self.l2_client.connect()
-        await self.l2_client.create_constraints_and_indexes()
-
-        # 2. Retrieval Engine
-        embed = EmbeddingUtils()
-
-        # Warmup: prime MiniLM + Neo4j pool so the first user message doesn't
-        # pay the 400-800ms cold-start penalty.
-        _warmup_loop = asyncio.get_running_loop()
-        await _warmup_loop.run_in_executor(None, embed.generate_embedding, "warmup")
-        await self.l2_client.execute_query("RETURN 1")
-
-        from memory.long_term import reranker as _reranker_module
-        await _warmup_loop.run_in_executor(None, _reranker_module.load_reranker)
+        embed = results[1]
+        
+        observer.info("parallel loading complete", ms=(time.perf_counter() - _t0) * 1000)
 
         self.retriever = MemoryRetrievalEngine(
             neo4j_client=self.l2_client,
@@ -134,52 +168,36 @@ class MemoryManager:
         )
         await self.retriever.ensure_fulltext_index()
 
-        # Prime Neo4j's query plan cache for every retrieval pattern.
-        # Without this, the first real user query pays a 200-500ms planning
-        # cost on top of execution. After warmup, all retrieval patterns
-        # use cached plans and land at steady-state latency.
-        await self.retriever.warmup()
-
-        # 3. Memory Router
         self.router = MemoryRouter(engine=self.retriever)
+        
+        # Wire up dependencies missed in task_working_memory
+        self.working_memory.retrieval_engine = self.retriever
+        self.working_memory._router = self.router
 
-        # 4. Working Context Manager (single source of truth)
-        self.context_manager = WorkingContextManager()
-
-        # 5. Working Memory (L1)
-        loop = asyncio.get_running_loop()
-        self.working_memory = WorkingMemory(
-            user_id=self.config.user_id,
-            retrieval_engine=self.retriever,
-            memory_router=self.router,
-            context_manager=self.context_manager,
-            event_loop=loop,
-        )
-
-        # 6. WorkspaceWatcher
         self._watcher = WorkspaceWatcher(
             context_manager=self.context_manager,
             proactive_callback=self._on_proactive_notification,
         )
         self._watcher.start()
 
-        # 7. End-to-end pipeline warmup
-        # Drive one benign message through the full observe -> reactive_processing
-        # -> router -> rerank path so GLiNER, the cross-encoder, and the first
-        # Neo4j round-trip all pay their cold-start cost here instead of on the
-        # user's first message. Without this the very first observe() consumes
-        # 800-1500ms of JIT/connection-warm overhead and times out the wait.
         self.is_initialized = True  # set early so observe() doesn't refuse
-        try:
-            self.working_memory._processing_done.clear()
-            await _warmup_loop.run_in_executor(
-                None,
-                self.working_memory.reactive_processing,
-                "system",
-                "warmup",
-            )
-        except Exception as exc:
-            observer.warning("end-to-end warmup failed (non-fatal)", error=str(exc))
+
+        # 3. Background the warmups so boot completes instantly
+        async def _run_warmups():
+            try:
+                await self.retriever.warmup()
+                self.working_memory._processing_done.clear()
+                await _loop.run_in_executor(
+                    None,
+                    self.working_memory.reactive_processing,
+                    "system",
+                    "warmup",
+                )
+            except Exception as exc:
+                observer.warning("background warmups failed (non-fatal)", error=str(exc))
+        
+        # Fire and forget the warmup task
+        _loop.create_task(_run_warmups())
 
         observer.info("MemoryManager.setup complete")
 

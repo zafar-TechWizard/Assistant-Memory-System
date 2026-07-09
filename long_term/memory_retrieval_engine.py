@@ -1559,12 +1559,14 @@ class MemoryRetrievalEngine:
 
         query = """
         UNWIND $entities AS entity
-        WITH toLower(entity) AS e
+        WITH replace(toLower(entity), ".", "") AS e
         MATCH (seed)
-        WHERE toLower(coalesce(seed.person_name, "")) = e
-           OR toLower(coalesce(seed.concept, ""))     = e
+        WHERE replace(toLower(coalesce(seed.person_name, "")), ".", "") = e
+           OR replace(toLower(coalesce(seed.concept, "")), ".", "")     = e
            OR any(p IN coalesce(seed.participants, [])
-                  WHERE toLower(p) = e)
+                  WHERE replace(toLower(p), ".", "") = e)
+           OR any(t IN coalesce(seed.tags, [])
+                  WHERE replace(toLower(t), ".", "") = e)
         WITH e, collect(DISTINCT seed.id)[..3] AS ids
         UNWIND ids AS id
         RETURN id
