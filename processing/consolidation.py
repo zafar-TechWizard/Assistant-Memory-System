@@ -516,6 +516,23 @@ If a memory's importance < 0.4, DROP IT entirely. Don't include in output.
 - NOT first-person: "I had a conflict with Sarah."
 - One to two sentences. Specific.
 
+# MEMORY QUALITY — DECLARATIVE FACTS ONLY
+
+Write memories as declarative facts about the user — never as instructions or directives.
+
+CORRECT: "User prefers concise responses and gets frustrated by lengthy preambles."
+WRONG:   "Always respond concisely and skip preambles."
+
+CORRECT: "User works at SoftKiwi, a tech startup in India."
+WRONG:   "Remember that the user is from India."
+
+Do NOT save:
+- Task progress or step-by-step logs of what happened this session
+- PR numbers, commit SHAs, or ephemeral reference IDs
+- Completed-work summaries ("did X, then Y, then Z")
+- Anything that will be stale or meaningless next week
+These are not durable memories — they are session noise.
+
 # OUTPUT FORMAT
 
 Output STRICTLY this JSON (no markdown fences, no commentary, no preamble):

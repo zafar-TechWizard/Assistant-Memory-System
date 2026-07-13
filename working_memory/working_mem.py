@@ -143,7 +143,17 @@ class WorkingMemory:
         # ── Persistence (crash recovery only — NO polling) ────────────────────
         cfg_file = context_file or config.context_file_path
         cfg_file.parent.mkdir(parents=True, exist_ok=True)
-        self._disk_ctx = DiskContextManager(cfg_file)  # disk persistence only
+        # Reuse the passed-in WorkingContextManager's own disk writer instead of
+        # creating a second, independent DiskContextManager pointed at the same
+        # file. Both objects do read-whole-file → mutate-one-key → write-whole-
+        # file; two separate Lock instances serializing separately (rather than
+        # one shared lock) meant _persist_state() here and
+        # update_sofi_state()/update_user_state() over in WorkingContextManager
+        # could race and silently clobber each other's just-written section.
+        # Falls back to a private instance only if no context_manager (or one
+        # without a `_disk` attribute) was supplied, e.g. in isolated tests.
+        _shared_disk = getattr(context_manager, "_disk", None)
+        self._disk_ctx = _shared_disk if _shared_disk is not None else DiskContextManager(cfg_file)
         # RefResolver handles all sidecar $ref I/O (context/assoc tiers, traces)
         self._ref_resolver = RefResolver(context_dir=cfg_file.parent)
         self._restore_from_disk()
