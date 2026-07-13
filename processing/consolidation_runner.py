@@ -145,7 +145,7 @@ class ConsolidationRunner:
         if not ok_neo:
             print()
             print("  -> Neo4j container is up but Bolt is not accepting connections")
-            print("    Check `docker logs sofi-neo4j-memory` for errors")
+            print(f"    Check `docker logs {self.docker_manager.container_name}` for errors")
             return False
 
         # 6. Pending sessions (optional)
@@ -176,7 +176,7 @@ class ConsolidationRunner:
 
     async def _ensure_docker_and_neo4j_container(self) -> Tuple[bool, str]:
         """
-        Ensure Docker daemon is running AND the sofi-neo4j-memory container
+        Ensure Docker daemon is running and the Neo4j container
         is up and healthy. Creates/starts container if needed.
         """
         try:

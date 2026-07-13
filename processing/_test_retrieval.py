@@ -247,7 +247,7 @@ async def test_l3_memory_manager() -> None:
 
     pillars = {
         "memory":    full.memory,
-        "sofi":      full.sofi,
+        "assistant": full.assistant,
         "user":      full.user,
         "workspace": full.workspace,
     }
@@ -258,10 +258,10 @@ async def test_l3_memory_manager() -> None:
         else:
             print(f"    [OK]    {name}: {type(p).__name__}")
 
-    if full.sofi:
-        _row("sofi.name",             full.sofi.name)
-        _row("sofi.current_datetime", full.sofi.current_datetime)
-        _row("sofi.time_of_day",      full.sofi.time_of_day)
+    if full.assistant:
+        _row("assistant.name",             full.assistant.name)
+        _row("assistant.current_datetime", full.assistant.current_datetime)
+        _row("assistant.time_of_day",      full.assistant.time_of_day)
 
     if full.user:
         _row("user.user_id",            full.user.user_id)

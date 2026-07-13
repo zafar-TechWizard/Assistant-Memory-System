@@ -1,5 +1,5 @@
 """
-SOFi Working Memory (L1) — In-Memory, Thread-Safe Cognitive Workspace
+Working Memory (L1) — In-Memory, Thread-Safe Cognitive Workspace
 
 Architecture
 ============
@@ -73,9 +73,9 @@ def _ts_ms() -> int:
 
 class WorkingMemory:
     """
-    SOFi's active cognitive workspace.
+    The assistant's active cognitive workspace.
 
-    This is the 'whiteboard' that SOFi reads when generating a response.
+    This is the 'whiteboard' the assistant reads when generating a response.
     It always reflects the freshest known state:
       - Which entities are currently active (and when they expire)
       - Which entities were in the very last message
@@ -148,7 +148,7 @@ class WorkingMemory:
         # file. Both objects do read-whole-file → mutate-one-key → write-whole-
         # file; two separate Lock instances serializing separately (rather than
         # one shared lock) meant _persist_state() here and
-        # update_sofi_state()/update_user_state() over in WorkingContextManager
+        # update_assistant_state()/update_user_state() over in WorkingContextManager
         # could race and silently clobber each other's just-written section.
         # Falls back to a private instance only if no context_manager (or one
         # without a `_disk` attribute) was supplied, e.g. in isolated tests.
@@ -166,7 +166,7 @@ class WorkingMemory:
         # 3 workers: LTM retrieval + logging + disk persistence run concurrently
         self._executor = ThreadPoolExecutor(
             max_workers=3,
-            thread_name_prefix="SOFiWM",
+            thread_name_prefix="MemoryWM",
         )
 
         observer.info(

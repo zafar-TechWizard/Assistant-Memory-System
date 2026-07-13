@@ -1,5 +1,5 @@
 """
-SOFi Memory Consolidation -- Agentic Pipeline via Gemini CLI
+Memory Consolidation -- Agentic Pipeline via Gemini CLI
 
 One reasoning pass per session. The Gemini CLI agent reads the conversation,
 sees pre-fetched relevant memories from the graph, and produces a complete
@@ -408,9 +408,9 @@ class ContextFetcher:
 # Builds the agent prompt, invokes gemini CLI, parses the plan.
 # ===============================================================================
 
-_AGENT_SYSTEM_INSTRUCTION = """You are SOFi's memory consolidation agent.
+_AGENT_SYSTEM_INSTRUCTION = """You are the memory consolidation agent.
 
-Your task: read a conversation, see what's already in SOFi's long-term memory
+Your task: read a conversation, see what's already in the assistant's long-term memory
 graph, and produce a precise plan for what to add, update, enhance, skip, or
 supersede.
 
@@ -523,7 +523,7 @@ Write memories as declarative facts about the user — never as instructions or 
 CORRECT: "User prefers concise responses and gets frustrated by lengthy preambles."
 WRONG:   "Always respond concisely and skip preambles."
 
-CORRECT: "User works at SoftKiwi, a tech startup in India."
+CORRECT: "User works at Acme Corp, a tech startup."
 WRONG:   "Remember that the user is from India."
 
 Do NOT save:

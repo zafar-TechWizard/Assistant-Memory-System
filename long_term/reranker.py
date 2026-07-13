@@ -1,5 +1,5 @@
 """
-SOFi Cross-Encoder Reranker — Local, no-API, single-model singleton.
+Cross-Encoder Reranker — Local, no-API, single-model singleton.
 
 Model: cross-encoder/ms-marco-MiniLM-L-6-v2 (22MB, runs locally)
 Loaded once at MemoryManager.setup() via load_reranker().

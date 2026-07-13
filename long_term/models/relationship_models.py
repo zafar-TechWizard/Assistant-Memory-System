@@ -1,9 +1,9 @@
 """
-Memory Context Relationship Models for SOFI Memory System
+Memory Context Relationship Models
 
 This module defines models for relationships between memories in different contexts.
 Relationships capture the complex interconnections between experiences, knowledge,
-relationships, and current focus that make SOFI's memory truly human-like and contextual.
+relationships, and current focus that make the memory system truly human-like and contextual.
 """
 
 from typing import Dict, List, Optional, Any, Union

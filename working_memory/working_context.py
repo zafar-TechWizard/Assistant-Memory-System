@@ -1,19 +1,19 @@
 """
-SOFi Working Context — Single Source of Truth for All Cognitive State
+Working Context — Single Source of Truth for All Cognitive State
 
 The Working Context is a live, multi-writer state document that represents
-everything SOFi knows, feels, is doing, and is responsible for at any moment.
+everything the assistant knows, feels, is doing, and is responsible for.
 
 Four Pillars
 ============
   1. MemoryState      — Tiered LTM memories + recent conversation turns
-  2. SofiState        — SOFi's own emotional state, self-awareness, env awareness
+  2. AssistantState   — The assistant's own state, self-awareness, env awareness
   3. UserState        — Who the user is, current state, what they need right now
   4. AgenticWorkspace — Active tasks, sub-agent outputs, reminders, proactive flags
 
 Thread Safety
 =============
-  WorkingContextManager uses a single RLock for memory/sofi/user section updates.
+  WorkingContextManager uses a single RLock for memory/assistant/user section updates.
   AgenticWorkspace has its own internal RLock so sub-agent writes never block
   the main working-memory thread and vice versa.
 
@@ -22,8 +22,8 @@ Writers
   working_mem.py        → updates MemoryState after every router call
   WorkspaceWatcher      → reads AgenticWorkspace; marks items HANDLED
   sub-agents            → write to AgenticWorkspace via workspace.add_item()
-  background timer      → updates SofiState.current_datetime every 60s
-  [future] EmotionalModule → writes SofiState.emotional_tone + UserState.current_emotional_state
+  background timer      → updates AssistantState.current_datetime every 60s
+  [future] EmotionalModule → writes AssistantState.emotional_tone + UserState.current_emotional_state
 """
 
 import json
@@ -65,7 +65,7 @@ class RetrievalMeta:
 @dataclass
 class MemoryState:
     """
-    Everything SOFi knows from memory at this moment.
+    Everything the assistant knows from memory at this moment.
 
     must_know    — directly answers the current query (coverage-verified)
     context      — relevant background
@@ -85,13 +85,13 @@ class MemoryState:
 
 
 # =============================================================================
-# PILLAR 2 — SOFI STATE
+# PILLAR 2 — ASSISTANT STATE
 # =============================================================================
 
 @dataclass
-class SofiState:
+class AssistantState:
     """
-    SOFi's own cognitive and emotional state.
+    The assistant's own cognitive and emotional state.
 
     Static fields (set at boot, rarely change):
         name, persona_version
@@ -101,8 +101,8 @@ class SofiState:
         last_action, current_focus,
         current_datetime, timezone, time_of_day
     """
-    # Identity (static)
-    name: str            = "SOFi"
+    # Identity (static) — name comes from config.assistant_name at boot
+    name: str            = "assistant"
     persona_version: str = "1.0"
 
     # Emotional state (updated by EmotionalModule — placeholder until then)
@@ -110,8 +110,8 @@ class SofiState:
     energy_level: str    = "normal"         # low | normal | high
     current_mode: str    = "conversational" # conversational | task-focused | empathetic | analytical
 
-    # Self-awareness (updated after each SOFi response)
-    last_action: str     = ""  # brief description of what she did last turn
+    # Self-awareness (updated after each response)
+    last_action: str     = ""  # brief description of what the assistant did last turn
     current_focus: str   = ""  # what she's attending to right now
 
     # Environmental awareness (updated by background timer every 60s)
@@ -132,7 +132,7 @@ class SofiState:
 @dataclass
 class UserState:
     """
-    Everything SOFi knows about the user right now.
+    Everything the assistant knows about the user right now.
 
     Profile fields (semi-static, loaded at boot from config / long-term memory):
         user_id, name, preferences
@@ -192,7 +192,7 @@ class WorkspaceItem:
     A single item in the Agentic Workspace.
 
     Sub-agents create these to communicate progress, completion, failures,
-    reminders, and alerts back to SOFi and the user.
+    reminders, and alerts back to the assistant and the user.
     """
     id: str                        = field(default_factory=lambda: str(uuid.uuid4()))
     type: WorkspaceItemType        = WorkspaceItemType.TASK
@@ -462,11 +462,11 @@ class AgenticWorkspace:
 @dataclass
 class WorkingContext:
     """
-    SOFi's complete cognitive state at a single point in time.
+    The assistant's complete cognitive state at a single point in time.
     This is what every system reads from. It is assembled by WorkingContextManager.
     """
     memory:    MemoryState
-    sofi:      SofiState
+    assistant: AssistantState
     user:      UserState
     workspace: AgenticWorkspace
     snapshot_at: datetime = field(default_factory=datetime.now)
@@ -486,13 +486,13 @@ class WorkingContextManager:
     Writers:
       working_mem.py      → update_memory()
       entity extractor    → update_user_state(mentioned_entities=...)
-      background timer    → update_sofi_state(current_datetime=...)
+      background timer    → update_assistant_state(current_datetime=...)
       user_state_inferencer → update_user_state(...)
-      response_analyzer   → update_sofi_response_state(...)
+      response_analyzer   → update_assistant_response_state(...)
       sub-agents          → workspace.add_item() / workspace.update_item()
 
     Disk persistence (Phase 4):
-      update_sofi_state() and update_user_state() fire-and-forget their
+      update_assistant_state() and update_user_state() fire-and-forget their
       sections to working_context.json via DiskContextManager.save_section().
       The executor (1 worker) serialises writes without blocking callers.
     """
@@ -506,10 +506,14 @@ class WorkingContextManager:
         """
         self._lock = threading.RLock()
 
+        # The JSON section key for the assistant pillar — comes from config.assistant_name
+        # so it matches what wc_schema.make_default_context() wrote to disk.
+        self._assistant_section_key: str = config.assistant_name
+
         # Initialise all four pillars
         self._memory    = MemoryState()
-        self._sofi      = SofiState(
-            name=config.user_id,   # placeholder — SOFi's name comes from persona config
+        self._assistant = AssistantState(
+            name=config.assistant_name,
         )
         self._user      = UserState(
             user_id=config.user_id,
@@ -531,7 +535,7 @@ class WorkingContextManager:
 
         # 1-worker executor: serialises async section writes without blocking callers.
         self._persist_exec = ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix="SOFiWCPersist"
+            max_workers=1, thread_name_prefix="MemoryWCPersist"
         )
 
         # Kick off the background datetime timer immediately
@@ -570,48 +574,54 @@ class WorkingContextManager:
                     latency_ms=retrieval_meta.get("latency_ms", 0.0),
                 )
 
-    # ── SOFi section update ───────────────────────────────────────────────────
+    # ── Assistant section update ──────────────────────────────────────────────
 
-    def update_sofi_state(self, **kwargs) -> None:
+    def update_assistant_state(self, **kwargs) -> None:
         """
-        Update any field(s) on SofiState and fire-and-forget disk persist.
-        e.g. update_sofi_state(emotional_tone="concerned", current_mode="empathetic")
+        Update any field(s) on AssistantState and fire-and-forget disk persist.
+        e.g. update_assistant_state(emotional_tone="concerned", current_mode="empathetic")
         """
         with self._lock:
             for key, value in kwargs.items():
-                if hasattr(self._sofi, key):
-                    setattr(self._sofi, key, value)
+                if hasattr(self._assistant, key):
+                    setattr(self._assistant, key, value)
                 else:
-                    observer.warning("unknown SofiState field", field=key)
-            sofi_snapshot = self._build_sofi_section()
+                    observer.warning("unknown AssistantState field", field=key)
+            assistant_snapshot = self._build_assistant_section()
 
         self._persist_exec.submit(
-            self._disk.save_section, "sofi", sofi_snapshot, "sofi_state"
+            self._disk.save_section,
+            self._assistant_section_key,
+            assistant_snapshot,
+            "assistant_state",
         )
 
-    # ── SOFi response-analysis update ────────────────────────────────────────
+    # ── Assistant response-analysis update ───────────────────────────────────
 
-    def update_sofi_response_state(
+    def update_assistant_response_state(
         self,
         last_topics_discussed: Optional[List[str]] = None,
         last_commitments:      Optional[List[str]] = None,
         last_questions_asked:  Optional[List[str]] = None,
     ) -> None:
         """
-        Update the three post-response analysis fields on SofiState and persist.
+        Update the three post-response analysis fields on AssistantState and persist.
         Called fire-and-forget after each assistant turn.
         """
         with self._lock:
             if last_topics_discussed is not None:
-                self._sofi.last_topics_discussed = last_topics_discussed
+                self._assistant.last_topics_discussed = last_topics_discussed
             if last_commitments is not None:
-                self._sofi.last_commitments = last_commitments
+                self._assistant.last_commitments = last_commitments
             if last_questions_asked is not None:
-                self._sofi.last_questions_asked = last_questions_asked
-            sofi_snapshot = self._build_sofi_section()
+                self._assistant.last_questions_asked = last_questions_asked
+            assistant_snapshot = self._build_assistant_section()
 
         self._persist_exec.submit(
-            self._disk.save_section, "sofi", sofi_snapshot, "response_analyzer"
+            self._disk.save_section,
+            self._assistant_section_key,
+            assistant_snapshot,
+            "response_analyzer",
         )
 
     # ── User section update ───────────────────────────────────────────────────
@@ -651,7 +661,7 @@ class WorkingContextManager:
             from copy import deepcopy
             return WorkingContext(
                 memory=deepcopy(self._memory),
-                sofi=deepcopy(self._sofi),
+                assistant=deepcopy(self._assistant),
                 user=deepcopy(self._user),
                 workspace=self._workspace,   # AgenticWorkspace has its own lock
                 snapshot_at=datetime.now(),
@@ -664,10 +674,10 @@ class WorkingContextManager:
             from copy import deepcopy
             return deepcopy(self._memory)
 
-    def get_sofi_state(self) -> SofiState:
+    def get_assistant_state(self) -> AssistantState:
         with self._lock:
             from copy import deepcopy
-            return deepcopy(self._sofi)
+            return deepcopy(self._assistant)
 
     def get_user_state(self) -> UserState:
         with self._lock:
@@ -676,9 +686,9 @@ class WorkingContextManager:
 
     # ── Section serialisers (convert in-memory dataclasses → schema-v2 dicts) ──
 
-    def _build_sofi_section(self) -> Dict[str, Any]:
-        """Build the schema-v2 'sofi' section from live SofiState. Lock must be held."""
-        s = self._sofi
+    def _build_assistant_section(self) -> Dict[str, Any]:
+        """Build the schema-v2 assistant section from live AssistantState. Lock must be held."""
+        s = self._assistant
         return {
             "_v":               0,   # incremented by save_section
             "_owner":           "response_analyzer",
@@ -730,7 +740,8 @@ class WorkingContextManager:
         )
 
     def shutdown(self) -> None:
-        """Flush pending disk writes and shut down the persistence executor."""
+        """Flush pending disk writes, stop the datetime timer, shut down executor."""
+        self._timer_stop.set()
         try:
             self._persist_exec.shutdown(wait=True, cancel_futures=False)
         except Exception as exc:
@@ -740,10 +751,11 @@ class WorkingContextManager:
 
     def _start_datetime_timer(self) -> None:
         """
-        Background daemon thread that refreshes SofiState environmental
+        Background daemon thread that refreshes AssistantState environmental
         awareness (current_datetime, timezone, time_of_day) every 60 seconds.
         """
         import threading as _threading
+        self._timer_stop = _threading.Event()
         t = _threading.Thread(
             target=self._datetime_loop,
             name="wc-datetime-timer",
@@ -752,10 +764,11 @@ class WorkingContextManager:
         t.start()
 
     def _datetime_loop(self) -> None:
-        import time as _time
-        while True:
-            self._refresh_datetime()
-            _time.sleep(60)
+        while not self._timer_stop.wait(60):
+            try:
+                self._refresh_datetime()
+            except Exception:
+                pass
 
     def _refresh_datetime(self) -> None:
         now = datetime.now()
@@ -772,8 +785,10 @@ class WorkingContextManager:
         import time as _time
         tz_name = _time.tzname[0]
 
-        self.update_sofi_state(
+        self.update_assistant_state(
             current_datetime=now.isoformat(timespec="seconds"),
             timezone=tz_name,
             time_of_day=tod,
         )
+
+

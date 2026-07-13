@@ -1,5 +1,5 @@
 """
-SOFi Memory Router — Zero-LLM Intent Classification & Tiered Retrieval Dispatch
+Memory Router — Zero-LLM Intent Classification & Tiered Retrieval Dispatch
 
 Architecture Overview
 =====================

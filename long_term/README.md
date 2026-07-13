@@ -1,4 +1,4 @@
-# SOFI Long-Term Memory System
+# Long-Term Memory System
 
 > A sophisticated graph-based memory system for AI assistants that mimics human memory recall and association.
 
@@ -32,7 +32,7 @@
 
 ## 🎯 Overview
 
-SOFI's Long-Term Memory System is a production-ready, graph-based memory architecture that stores and retrieves memories using Neo4j. It mimics human memory by:
+The Long-Term Memory System is a production-ready, graph-based memory architecture that stores and retrieves memories using Neo4j. It mimics human memory by:
 
 - **Associative Recall**: Following connections between related memories
 - **Emotional Context**: Storing and filtering by emotional significance
@@ -57,7 +57,7 @@ SOFI's Long-Term Memory System is a production-ready, graph-based memory archite
 
 ```
 ┌──────────────────────────────────────────────────────────┐
-│                    SOFI APPLICATION                      │
+│                   ASSISTANT APPLICATION                   │
 │                                                          │
 │  ┌────────────────────────────────────────────────────┐  │
 │  │  Short-Term Memory (conversation.json)             │  │
@@ -1177,8 +1177,8 @@ asyncio.run(main())
 
 ```bash
 # Clone repository
-git clone https://github.com/your-repo/sofi-memory.git
-cd sofi-memory
+git clone https://github.com/your-org/assistant-memory.git
+cd assistant-memory
 
 # Install dependencies
 pip install -r requirements.txt
@@ -1481,6 +1481,6 @@ print(f"Total relationships: {stats['total_relationships']}")
 
 ---
 
-**Built with ❤️ by the SOFI Developer [Zafar](https://github.com/zafar-TechWizard)**
+**Built with ❤️ for the open-source AI community.**
 
 *Making AI assistants more human, one memory at a time.*

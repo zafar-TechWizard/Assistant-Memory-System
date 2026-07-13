@@ -1,5 +1,5 @@
 # ═══════════════════════════════════════════════════════════════════════════════
-# SOFi Memory System — Dependencies
+# Memory System — Dependencies
 # ═══════════════════════════════════════════════════════════════════════════════
 # Install: pip install -r memory/requirements.txt
 #
@@ -7,8 +7,9 @@
 #   python -m spacy download en_core_web_sm
 #   python -m coreferee install en
 #
-# Required environment variable for consolidation:
-#   export GROQ_API_KEY=your_key
+# Required environment variables:
+#   MEMORY_USER_ID    — identity of the memory owner
+#   NEO4J_PASSWORD    — Neo4j database password
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
@@ -36,10 +37,8 @@ gliner>=0.2.0                # zero-shot NER for concept-level entities
 dateparser>=1.2.0            # "last Tuesday", "two weeks ago" → datetime
 
 
-# ── Consolidation Pipeline (nightly LLM extraction) ───────────────────────────
-groq>=0.4.1                  # async Groq client for qwen3-32b extraction
-
-
-# ── Optional but recommended ──────────────────────────────────────────────────
-# Used by working_memory + consolidation for atomic writes and HTTP health checks.
-# Standard library covers most needs; nothing else required at the memory layer.
+# ── Consolidation Pipeline ────────────────────────────────────────────────────
+# The nightly consolidation pipeline uses the Gemini CLI binary (external tool,
+# not a Python package). Install it separately:
+#   https://github.com/google-gemini/gemini-cli
+# Set GEMINI_API_KEY in your environment before running consolidation.

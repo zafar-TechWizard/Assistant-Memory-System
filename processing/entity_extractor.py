@@ -1,5 +1,7 @@
 import importlib.util
 import re
+import subprocess
+import sys
 from collections import OrderedDict
 from dataclasses import dataclass, asdict, field
 from enum import Enum
@@ -27,12 +29,46 @@ except ImportError:
     GLiNER = None
 
 # coreferee: spaCy plugin for co-reference resolution. Optional dependency.
-# Install: pip install coreferee && python -m coreferee install en
-# We check installation via find_spec — spaCy auto-loads the plugin via entry
-# points when add_pipe("coreferee") is called, no direct import needed.
 COREFEREE_AVAILABLE = importlib.util.find_spec("coreferee") is not None
 
 from memory.observability import observer
+
+
+def _ensure_spacy_model(model_name: str) -> None:
+    """Download the spaCy model if not already installed."""
+    if not SPACY_AVAILABLE:
+        return
+    if not spacy.util.is_package(model_name):
+        observer.info(f"spaCy model '{model_name}' not found — downloading...")
+        result = subprocess.run(
+            [sys.executable, "-m", "spacy", "download", model_name],
+            capture_output=True, text=True,
+        )
+        if result.returncode == 0:
+            observer.info(f"spaCy model '{model_name}' installed")
+        else:
+            observer.warning(f"spaCy model download failed", model=model_name, stderr=result.stderr[:200])
+
+
+def _ensure_coreferee_en() -> None:
+    """Download coreferee English model data if not already installed."""
+    if not COREFEREE_AVAILABLE:
+        return
+    try:
+        import coreferee
+        data_dir = Path(coreferee.__file__).parent / "data"
+        if not data_dir.exists() or not any(data_dir.glob("en_*")):
+            observer.info("coreferee English model not found — downloading...")
+            result = subprocess.run(
+                [sys.executable, "-m", "coreferee", "install", "en"],
+                capture_output=True, text=True,
+            )
+            if result.returncode == 0:
+                observer.info("coreferee English model installed")
+            else:
+                observer.warning("coreferee English model download failed", stderr=result.stderr[:200])
+    except Exception as e:
+        observer.warning("coreferee model check failed", error=str(e))
 
 class EntityType(Enum):
     """Types of entities that can be extracted"""
@@ -147,6 +183,7 @@ class EntityExtractor:
         self.spacy_available = False
 
         if SPACY_AVAILABLE:
+            _ensure_spacy_model(spacy_model)
             try:
                 self.nlp = spacy.load(spacy_model)
                 self.spacy_available = True
@@ -157,7 +194,7 @@ class EntityExtractor:
                         f"spaCy model '{spacy_model}' not available. "
                         f"Install with: python -m spacy download {spacy_model}"
                     )
-                observer.warning("spaCy unavailable — using fallback", error=str(e))
+                observer.warning("spaCy load failed after download attempt", error=str(e))
         else:
             if strict_spacy:
                 raise RuntimeError("spaCy not installed. Install with: pip install spacy")
@@ -166,13 +203,14 @@ class EntityExtractor:
         # ── Add coreferee to spaCy pipeline (pronoun resolution) ─────────────
         self.coref_available = False
         if use_coreferee and self.spacy_available and COREFEREE_AVAILABLE:
+            _ensure_coreferee_en()
             try:
                 if "coreferee" not in self.nlp.pipe_names:
                     self.nlp.add_pipe("coreferee")
                 self.coref_available = True
                 observer.info("coreferee pipeline enabled")
             except Exception as e:
-                observer.warning("coreferee unavailable", error=str(e))
+                observer.warning("coreferee pipeline failed", error=str(e))
         elif use_coreferee and not COREFEREE_AVAILABLE:
             observer.info("coreferee not installed — pronoun resolution disabled")
 
@@ -524,7 +562,7 @@ class EntityExtractor:
         Example:
             >>> extractor.add_custom_pattern(
             ...     "project_names",
-            ...     ["SOFI", "Assistant Memory System"],
+            ...     ["Assistant Memory", "Assistant Memory System"],
             ...     pattern_type="phrase"
             ... )
         """

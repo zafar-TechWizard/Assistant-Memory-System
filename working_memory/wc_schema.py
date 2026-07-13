@@ -8,7 +8,7 @@ Design rules (pre-set, not dynamic):
   INLINE  — small, hot, read every turn; always stored directly in the JSON.
   REF     — large or append-heavy; stored in a sidecar file, pointer in JSON.
 
-This module has zero dependencies on other SOFi components.  It is the
+This module has zero dependencies on other memory components.  It is the
 single authoritative source for what working_context.json looks like.
 
 Inline/Ref rules
@@ -16,7 +16,7 @@ Inline/Ref rules
   INLINE:
     _meta, session,
     user (all fields),
-    sofi (all fields),
+    <assistant_name> section (all fields — key is config.assistant_name),
     memory.intent / confidence / retrieval_ms / active_entities / current_entities,
     memory.tiers.must_know.items  (always small — 3-5 items max),
     memory.tiers.context.count + assoc.count  (counts only),
@@ -50,14 +50,23 @@ SCHEMA_VERSION: str = "2.0"
 # Default values — used by make_default_context() and backfill logic.
 # ---------------------------------------------------------------------------
 
-def make_default_context(session_id: str = "", prev_session_id: str = "") -> Dict[str, Any]:
+def make_default_context(
+    session_id: str = "",
+    prev_session_id: str = "",
+    assistant_section_key: str = "assistant",
+) -> Dict[str, Any]:
     """
     Return a fully-defaulted, empty working context document.
 
     All sections are present with their correct shapes so callers never
     need to guard against missing keys.
+
+    Args:
+        assistant_section_key: Top-level JSON key for the assistant state section.
+            Comes from config.assistant_name (e.g. "assistant", "aria", "nova").
+            Defaults to "assistant" — the generic name for open-source use.
     """
-    return {
+    doc: Dict[str, Any] = {
         # ── SCHEMA HEADER ─────────────────────────────────────────────────────
         "_meta": {
             "schema_version": SCHEMA_VERSION,
@@ -88,23 +97,6 @@ def make_default_context(session_id: str = "", prev_session_id: str = "") -> Dic
             "current_focus":       "",
             "mentioned_entities":  [],
             "sentiment":           0.0,
-        },
-
-        # ── SOFI STATE (all inline) ───────────────────────────────────────────
-        "sofi": {
-            "_v":              0,
-            "_owner":          "response_analyzer",
-            "_updated_at":     "",
-            "mode":            "conversational",
-            "energy_level":    "normal",
-            "emotional_tone":  "neutral",
-            "current_focus":   "",
-            "last_topics":     [],
-            "last_commitments":[],
-            "last_questions":  [],
-            "current_datetime":"",
-            "timezone":        "",
-            "time_of_day":     "",
         },
 
         # ── MEMORY CONTEXT ────────────────────────────────────────────────────
@@ -149,7 +141,7 @@ def make_default_context(session_id: str = "", prev_session_id: str = "") -> Dic
         },
 
         # ── CAPABILITIES ──────────────────────────────────────────────────────
-        # Single authoritative map of what SOFi can do right now.
+        # Single authoritative map of what the assistant can do right now.
         # Replaces both persona baseline + SelfModel dual description.
         "capabilities": {
             "_v":     0,
@@ -190,6 +182,26 @@ def make_default_context(session_id: str = "", prev_session_id: str = "") -> Dic
         "memories":         [],
     }
 
+    # ── ASSISTANT STATE (all inline) — key is caller-supplied ─────────────────
+    # Must be set after the dict literal since the key is a runtime value.
+    doc[assistant_section_key] = {
+        "_v":              0,
+        "_owner":          "response_analyzer",
+        "_updated_at":     "",
+        "mode":            "conversational",
+        "energy_level":    "normal",
+        "emotional_tone":  "neutral",
+        "current_focus":   "",
+        "last_topics":     [],
+        "last_commitments":[],
+        "last_questions":  [],
+        "current_datetime":"",
+        "timezone":        "",
+        "time_of_day":     "",
+    }
+
+    return doc
+
 
 # ---------------------------------------------------------------------------
 # Per-section inline rules (informational — used by writers to decide
@@ -199,7 +211,7 @@ INLINE_FIELDS: frozenset = frozenset({
     "_meta",
     "session",
     "user",
-    "sofi",
+    "assistant",   # generic default; actual key matches config.assistant_name
     "memory._meta",
     "memory.intent",
     "memory.intent_confidence",
@@ -250,13 +262,13 @@ class EventType:
 # Called by DiskContextManager.load_full() when reading an older file.
 # ---------------------------------------------------------------------------
 
-def backfill(doc: Dict[str, Any]) -> Dict[str, Any]:
+def backfill(doc: Dict[str, Any], assistant_section_key: str = "assistant") -> Dict[str, Any]:
     """
     Merge missing top-level keys from make_default_context() into doc.
     Existing values are never overwritten — only gaps are filled.
     Returns the same dict (mutated in place for efficiency).
     """
-    defaults = make_default_context()
+    defaults = make_default_context(assistant_section_key=assistant_section_key)
     for key, default_val in defaults.items():
         if key not in doc:
             doc[key] = default_val

@@ -1,8 +1,8 @@
 """
-Neo4j Database Client for SOFI Memory System
+Neo4j Database Client for the Memory System
 
-This module provides a robust Neo4j client with connection pooling, retry logic,
-and performance optimization for the SOFI memory system's Layer 2 knowledge graph.
+Provides a robust async Neo4j client with connection pooling, retry logic,
+and performance optimization for the memory system's Layer 2 knowledge graph.
 """
 
 import asyncio
@@ -29,7 +29,7 @@ class Neo4jConfig(BaseModel):
     """Configuration for Neo4j connection"""
     uri: str = Field(default="bolt://localhost:7687", description="Neo4j connection URI")
     username: str = Field(default="neo4j", description="Database username")
-    password: str = Field(default="password123", description="Database password")
+    password: str = Field(default="", description="Database password — must be set explicitly")
     database: str = Field(default="neo4j", description="Database name")
     max_connection_lifetime: int = Field(default=3600, description="Max connection lifetime in seconds")
     max_connection_pool_size: int = Field(default=100, description="Max connection pool size")
@@ -53,33 +53,30 @@ class Neo4jClient:
     def __init__(self, config: Neo4jConfig):
         self.config = config
         self.driver: Optional[AsyncDriver] = None
-        self._connection_pool = None
         self._is_connected = False
-        
-    async def connect(self) -> None:
-        """Initialize connection to Neo4j database"""
-        try:
-            self.driver = AsyncGraphDatabase.driver(
-                self.config.uri,
-                auth=(self.config.username, self.config.password),
-                max_connection_lifetime=self.config.max_connection_lifetime,
-                max_connection_pool_size=self.config.max_connection_pool_size,
-                connection_acquisition_timeout=self.config.connection_acquisition_timeout,
-                max_transaction_retry_time=self.config.max_transaction_retry_time,
-                # Suppress UNRECOGNIZED-edge-type and missing-property notifications.
-                # Our queries reference all 23 typed edges even when the graph only
-                # has a subset — Neo4j warns about the absent types. Cosmetic noise.
-                notifications_min_severity="OFF",
-            )
-            
-            # Test connection
-            await self._test_connection()
-            self._is_connected = True
-            observer.info("connected to Neo4j", uri=self.config.uri)
 
+    async def connect(self) -> None:
+        """Initialize connection to Neo4j database."""
+        self.driver = AsyncGraphDatabase.driver(
+            self.config.uri,
+            auth=(self.config.username, self.config.password),
+            max_connection_lifetime=self.config.max_connection_lifetime,
+            max_connection_pool_size=self.config.max_connection_pool_size,
+            connection_acquisition_timeout=self.config.connection_acquisition_timeout,
+            max_transaction_retry_time=self.config.max_transaction_retry_time,
+            # Suppress UNRECOGNIZED-edge-type and missing-property notifications.
+            # Queries reference all typed edges even when the graph has a subset.
+            notifications_min_severity="OFF",
+        )
+        try:
+            await self._test_connection()
         except Exception as e:
+            await self.driver.close()
+            self.driver = None
             observer.error("Neo4j connection failed", exception=e, uri=self.config.uri)
             raise
+        self._is_connected = True
+        observer.info("connected to Neo4j", uri=self.config.uri)
 
     async def disconnect(self) -> None:
         """Close connection to Neo4j database"""
@@ -306,7 +303,7 @@ class Neo4jClient:
 def create_neo4j_client(
     uri: str = "bolt://localhost:7687",
     username: str = "neo4j", 
-    password: str = "password123",
+    password: str = "",
     database: str = "neo4j",
     **kwargs
 ) -> Neo4jClient:

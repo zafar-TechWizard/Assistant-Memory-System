@@ -1,5 +1,5 @@
 """
-SOFi WorkspaceWatcher — Background Proactive Notification Monitor
+WorkspaceWatcher — Background Proactive Notification Monitor
 
 Runs as a daemon thread. Every `poll_interval_s` seconds (configured in
 config.workspace_watcher_poll_interval_s, default 5s) it checks the
@@ -17,13 +17,13 @@ Priority Levels
   NORMAL — fire only if the user has been inactive for gap_threshold_s seconds
   LOW    — do NOT fire proactively; these surface naturally via the Working
             Context snapshot (the mandatory injection slice always includes
-            pending LOW items so SOFi sees them at the next user turn)
+            pending LOW items so the assistant sees them at the next user turn)
 
 The callback signature is:
     proactive_callback(item: WorkspaceItem) -> None
 
 The caller (MemoryManager or the main assistant loop) injects this callback
-and is responsible for actually activating SOFi (e.g., triggering an LLM call
+and is responsible for activating the assistant (e.g., triggering an LLM call
 with the current Working Context as the system prompt).
 """
 
@@ -190,7 +190,7 @@ class WorkspaceWatcher:
     def _fire(self, item: WorkspaceItem) -> None:
         """
         Mark the item as HANDLED and invoke the proactive callback.
-        The callback is responsible for activating SOFi.
+        The callback is responsible for activating the assistant.
         """
         # Mark HANDLED first so a second poll cycle doesn't double-fire
         self._ctx.workspace.update_item(

@@ -1,19 +1,26 @@
-name: Notify SOFI on prod push
+name: Notify downstream on prod push
 
-# Whenever memory's prod branch gets a push, trigger SOFI to
-# update its submodule pointer to the latest prod commit.
+# Whenever memory's prod branch gets a push, trigger the downstream
+# repository to update its submodule pointer to the latest prod commit.
+#
+# Required secret:  MEMORY_SYNC_TOKEN
+#   A GitHub PAT with `repo` scope for the downstream repository.
+#
+# Required variable: DOWNSTREAM_REPO
+#   The downstream repository in "owner/repo" format.
+#   Set in Settings → Secrets and variables → Actions → Variables.
 on:
   push:
     branches: [prod]
 
 jobs:
-  trigger-sofi-sync:
+  trigger-downstream-sync:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Trigger SOFI submodule sync
+      - name: Trigger downstream submodule sync
         uses: peter-evans/repository-dispatch@v3
         with:
-          token: ${{ secrets.SOFI_SYNC_TOKEN }}
-          repository: zafar-TechWizard/SOFI
+          token: ${{ secrets.MEMORY_SYNC_TOKEN }}
+          repository: ${{ vars.DOWNSTREAM_REPO }}
           event-type: memory-updated

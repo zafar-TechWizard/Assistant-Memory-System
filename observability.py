@@ -1,5 +1,5 @@
 """
-SOFi Memory — Observability
+Memory System — Observability
 
 Two independent modes, both off by default. The singleton `observer` is the
 single entry point — every component imports it and calls its methods.

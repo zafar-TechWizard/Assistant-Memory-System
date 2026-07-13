@@ -1,5 +1,5 @@
 """
-Memory Context Models for SOFI Memory System
+Memory Context Models
 
 This module defines Pydantic models for the hybrid memory system using Memory Contexts.
 Instead of rigid entity types, memories are organized by context - how they're used and

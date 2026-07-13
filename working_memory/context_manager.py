@@ -1,5 +1,5 @@
 """
-SOFi Working Context Manager — Thread-Safe Disk Persistence
+Working Context Manager — Thread-Safe Disk Persistence
 
 Responsibilities:
   - Provide a thread-safe load() / save() interface for the working_context.json file.
@@ -25,7 +25,14 @@ from pathlib import Path
 from threading import Lock
 from typing import Any, Dict, List, Optional
 
+from memory.config import config as _mem_config
 from memory.observability import observer
+from memory.working_memory.wc_schema import backfill as _wc_backfill, make_default_context as _make_default
+
+
+def _backfill(doc):
+    """Backfill missing keys using the configured assistant section key."""
+    return _wc_backfill(doc, assistant_section_key=_mem_config.assistant_name)
 
 # Minimum structure guaranteed to exist in every loaded context (legacy compat)
 _DEFAULTS: Dict[str, Any] = {
@@ -102,12 +109,11 @@ class WorkingContextManager:
         Returns:
             Complete working context dict with all schema sections present.
         """
-        from memory.working_memory.wc_schema import backfill
 
         with self._lock:
             data = self._read_raw()
 
-        return backfill(data)
+        return _backfill(data)
 
     def save_section(
         self,
@@ -124,15 +130,14 @@ class WorkingContextManager:
         thread can interleave a write in between.
 
         Args:
-            section:      Top-level key in the document (e.g. "user", "sofi").
+            section:      Top-level key in the document (e.g. "user", "assistant").
             section_data: New value for that key.
             updated_by:   Component name for the _meta.updated_by audit field.
         """
-        from memory.working_memory.wc_schema import backfill
 
         with self._lock:
             data = self._read_raw()
-            data = backfill(data)
+            data = _backfill(data)
 
             data[section] = section_data
 
@@ -166,11 +171,10 @@ class WorkingContextManager:
 
         Returns the sequence number assigned to the event.
         """
-        from memory.working_memory.wc_schema import backfill
 
         with self._lock:
             data = self._read_raw()
-            data = backfill(data)
+            data = _backfill(data)
 
             meta = data.setdefault("_meta", {})
             new_seq = int(meta.get("sequence", 0)) + 1
@@ -212,11 +216,10 @@ class WorkingContextManager:
             caps: Dict mapping capability_name →
                   {installed: bool, available: bool, last_failure?: str}
         """
-        from memory.working_memory.wc_schema import backfill
 
         with self._lock:
             data = self._read_raw()
-            data = backfill(data)
+            data = _backfill(data)
 
             cap_section = data.setdefault("capabilities", {})
             cap_section["_v"]     = int(cap_section.get("_v", 0)) + 1
@@ -240,11 +243,10 @@ class WorkingContextManager:
         Update events.last_read_seq so Brain tracks which events are new.
         Called by Brain after draining the event ring at turn start.
         """
-        from memory.working_memory.wc_schema import backfill
 
         with self._lock:
             data = self._read_raw()
-            data = backfill(data)
+            data = _backfill(data)
             data.setdefault("events", {})["last_read_seq"] = last_seq
             self._write_raw(data)
 
@@ -253,12 +255,11 @@ class WorkingContextManager:
         Return all event records with seq > events.last_read_seq.
         Does NOT update last_read_seq — call mark_last_event_read() after processing.
         """
-        from memory.working_memory.wc_schema import backfill
 
         with self._lock:
             data = self._read_raw()
 
-        data = backfill(data)
+        data = _backfill(data)
         events = data.get("events", {})
         last_read = int(events.get("last_read_seq", 0))
         return [e for e in events.get("items", []) if e.get("seq", 0) > last_read]
@@ -323,5 +324,6 @@ class WorkingContextManager:
         """Create the file with the full default schema if it doesn't exist yet."""
         if not self.file_path.exists():
             self.file_path.parent.mkdir(parents=True, exist_ok=True)
-            from memory.working_memory.wc_schema import make_default_context
-            self.save(make_default_context())
+            self.save(_make_default(
+                assistant_section_key=_mem_config.assistant_name,
+            ))

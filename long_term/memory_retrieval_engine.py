@@ -1,7 +1,7 @@
 """
-SOFI Memory Retrieval Engine - Complete Implementation
+Memory Retrieval Engine — Complete Implementation
 
-This module provides a comprehensive retrieval interface for SOFI's graph memory system.
+This module provides a comprehensive retrieval interface for the graph memory system.
 It offers multiple retrieval patterns to fetch memories in any manner needed.
 
 Features:
@@ -120,7 +120,7 @@ INTENT_MULTIPLIERS: Dict[str, Dict[str, float]] = {
 
 class MemoryRetrievalEngine:
     """
-    Comprehensive retrieval engine for SOFI's graph memory system.
+    Comprehensive retrieval engine for the graph memory system.
     
     This class provides 20+ retrieval methods organized into categories:
     - Basic retrieval (topics, keywords)

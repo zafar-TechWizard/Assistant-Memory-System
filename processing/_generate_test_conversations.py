@@ -1,9 +1,9 @@
 """
-Generate a realistic conversation.json for testing SOFi's consolidation.
+Generate a realistic conversation.json for testing the consolidation pipeline.
 
 The goal is conversations that READ like transcripts of actual exchanges, not
 scripts. Real people type in fragments, lowercase, half-thoughts, with tangents
-and callbacks. SOFi sounds helpful but not robotic — no perfectly-formatted
+and callbacks. The assistant sounds helpful but not robotic — no perfectly-formatted
 status reports, no over-articulated explanations.
 
 Writes to <config.conversation_log_path> = <project>/BRAIN/memory/data/conversation.json

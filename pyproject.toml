@@ -1,0 +1,59 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "assistant-memory"
+version = "0.1.0"
+description = "Plug-and-play long-term + working memory for AI assistants"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { file = "LICENSE" }
+keywords = [
+    "ai", "memory", "assistant", "neo4j", "agent",
+    "long-term-memory", "working-memory", "knowledge-graph",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Typing :: Typed",
+]
+
+# Hard runtime dependencies — always installed
+dependencies = [
+    "neo4j>=5.15.0",
+    "tenacity>=8.2.3",
+    "pydantic>=2.5.0,<3.0",
+    "sentence-transformers>=2.2.2,<4.0",
+    "numpy>=1.24.3,<3.0",
+    "dateparser>=1.2.0",
+]
+
+[project.optional-dependencies]
+# Full NLP stack — entity extraction, coreference resolution, zero-shot NER
+nlp = [
+    "spacy>=3.7.0",
+    "coreferee>=1.4.0",
+    "gliner>=0.2.0",
+]
+dev = [
+    "pytest>=7.0",
+    "pytest-asyncio>=0.21",
+]
+
+[project.urls]
+Repository   = "https://github.com/your-org/assistant-memory"
+Documentation = "https://github.com/your-org/assistant-memory#readme"
+"Bug Tracker" = "https://github.com/your-org/assistant-memory/issues"
+
+[tool.setuptools.packages.find]
+include = ["memory*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
