@@ -286,6 +286,20 @@ _W_CASUAL         = 0.65
 # Both intents above this threshold → run both primaries concurrently
 _CO_FIRE_THRESHOLD = 0.50
 
+# ---------------------------------------------------------------------------
+# Named constants — no bare numeric literals in logic below
+# ---------------------------------------------------------------------------
+
+# Coverage-verified memories are pinned above all heat-score candidates so
+# they always surface in must_know. The value (5.0) exceeds any realistic
+# heat score, making coverage wins unconditional without a separate branch.
+_COVERAGE_SCORE_FLOOR: float = 5.0
+
+# Per-retrieval Hebbian boost applied to co-activated graph edges.
+# Small by design: 50 co-retrievals move a fresh 0.5 edge to 1.0.
+# Balances learning speed against noise amplification on sparse graphs.
+_HEBBIAN_STRENGTH_BOOST: float = 0.02
+
 
 class IntentClassifier:
     """
@@ -1023,7 +1037,7 @@ class MemoryRouter:
             score = self._heat_score(m, ents, intent=intent)
             # Coverage-verified memories always surface above un-retrieved candidates
             if mid in backup_ids or m.get("_coverage_source"):
-                score = max(score, 5.0)
+                score = max(score, _COVERAGE_SCORE_FLOOR)
             scored.append((score, m))
 
         scored.sort(key=lambda x: x[0], reverse=True)
@@ -1130,7 +1144,7 @@ class MemoryRouter:
             self._engine.reinforce_memory_connection(
                 from_memory_id=ids[i],
                 to_memory_id=ids[j],
-                strength_boost=0.02,
+                strength_boost=_HEBBIAN_STRENGTH_BOOST,
             )
             for i in range(len(ids))
             for j in range(i + 1, len(ids))

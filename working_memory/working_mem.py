@@ -59,6 +59,16 @@ from memory.observability import observer, summarize_working_context
 
 
 # ---------------------------------------------------------------------------
+# Named constants
+# ---------------------------------------------------------------------------
+
+# The MemoryRouter gets this fraction of the total context-retrieval budget.
+# The remaining 20 % is reserved for get_working_context()'s own threading.Event
+# wait, ensuring the caller always has a response window even when the router
+# runs to the edge of its budget.
+_ROUTER_TIMEOUT_RATIO: float = 0.80
+
+# ---------------------------------------------------------------------------
 # Tiny helpers
 # ---------------------------------------------------------------------------
 
@@ -494,6 +504,14 @@ class WorkingMemory:
         """
         Flush state to disk and shut down the thread pool.
         Call from memory_manager.shutdown() (sync context is fine).
+
+        This is the ONLY reliable cleanup path. There is no __del__ fallback.
+        Consequence: if shutdown() is never called (e.g. the process is killed
+        or the developer forgets), the ThreadPoolExecutor's daemon threads will
+        keep running until the interpreter exits. On a clean exit Python's
+        atexit machinery will eventually reap them, but in-flight background
+        tasks (disk persist, log write) may be cut short and the final state
+        snapshot will not be written. Always call await manager.shutdown().
         """
         try:
             self._persist_state()
@@ -582,7 +600,7 @@ class WorkingMemory:
                 self._router.route(message, list(entities)),
                 self._loop,
             )
-            return future.result(timeout=self._timeout_s * 0.80)
+            return future.result(timeout=self._timeout_s * _ROUTER_TIMEOUT_RATIO)
         except TimeoutError:
             observer.warning(
                 "router timeout",
@@ -817,10 +835,3 @@ class WorkingMemory:
         except Exception as exc:
             observer.warning("conversation log write failed", error=str(exc))
 
-    def __del__(self) -> None:
-        """Best-effort cleanup on GC — do not rely on this for correctness."""
-        try:
-            if hasattr(self, "_executor"):
-                self._executor.shutdown(wait=False, cancel_futures=True)
-        except Exception:
-            pass

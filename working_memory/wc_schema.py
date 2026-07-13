@@ -192,6 +192,7 @@ def make_default_context(
         "energy_level":    "normal",
         "emotional_tone":  "neutral",
         "current_focus":   "",
+        "last_action":     "",
         "last_topics":     [],
         "last_commitments":[],
         "last_questions":  [],

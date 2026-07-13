@@ -322,25 +322,25 @@ class MemoryRetrievalEngine:
     ) -> List[Dict[str, Any]]:
         """
         Retrieve memories about a topic AND all connected memories.
-        
+
         This follows graph relationships to find related memories,
         mimicking human associative memory recall.
-        
+
         Args:
             topic: The topic/person to search for
             max_hops: Maximum relationship hops to traverse (1-3 recommended)
             limit: Maximum number of root memories to return
-            
+
         Returns:
             List of dictionaries with root_id, root_content, connected_memories
-            
+
         Example:
             ```python
             results = await engine.get_memories_with_connected_nodes(
                 "father",
                 max_hops=2
             )
-            
+
             for item in results:
                 print(f"Main: {item['root_content']}")
                 print(f"Connected: {len(item['connected_memories'])}")
@@ -348,14 +348,16 @@ class MemoryRetrievalEngine:
         """
         query = f"""
         MATCH (root)
-        WHERE toLower(coalesce(root.content, "")) CONTAINS toLower($topic)
+        WHERE (toLower(coalesce(root.content, "")) CONTAINS toLower($topic)
            OR toLower(coalesce(root.person_name, "")) = toLower($topic)
            OR toLower(coalesce(root.concept, "")) CONTAINS toLower($topic)
-           OR any(p IN coalesce(root.participants, []) WHERE toLower(p) = toLower($topic))
-        
-        OPTIONAL MATCH path = (root)-[r:MEMORY_RELATIONSHIP*1..{max_hops}]-(connected)
-        
-        RETURN 
+           OR any(p IN coalesce(root.participants, []) WHERE toLower(p) = toLower($topic)))
+          AND NOT coalesce(root.superseded, false)
+
+        OPTIONAL MATCH path = (root)-[r*1..{max_hops}]-(connected)
+        WHERE NOT coalesce(connected.superseded, false)
+
+        RETURN
             root.id as root_id,
             root.content as root_content,
             labels(root) as root_type,
@@ -407,7 +409,7 @@ class MemoryRetrievalEngine:
         """
         query = f"""
         MATCH (root {{id: $memory_id}})
-        MATCH path = (root)-[r:MEMORY_RELATIONSHIP*1..{max_hops}]-(connected)
+        MATCH path = (root)-[r*1..{max_hops}]-(connected)
         RETURN DISTINCT
             connected.id as id,
             connected.content as content,
@@ -457,7 +459,7 @@ class MemoryRetrievalEngine:
         """
         query = f"""
         MATCH (start {{id: $memory_id}})
-        MATCH path = (start)-[r:MEMORY_RELATIONSHIP*1..{max_hops}]-(member)
+        MATCH path = (start)-[r*1..{max_hops}]-(member)
         WITH member, count(path) as connection_count
         WHERE connection_count >= $min_connections
         RETURN 
@@ -641,7 +643,7 @@ class MemoryRetrievalEngine:
             )
             YIELD node, score
 
-            OPTIONAL MATCH (node)-[r:MEMORY_RELATIONSHIP*1..{max_hops}]-(connected)
+            OPTIONAL MATCH (node)-[r*1..{max_hops}]-(connected)
 
             RETURN
                 node.id as id,
@@ -719,15 +721,16 @@ class MemoryRetrievalEngine:
             query = """
             WITH $topics as topics
             UNWIND topics as topic
-            
+
             MATCH (m)
-            WHERE m.content CONTAINS topic
-               OR m.person_name = topic
-               OR topic IN m.participants
-            
-            OPTIONAL MATCH (m)-[r:MEMORY_RELATIONSHIP]-(connected)
-            
-            RETURN 
+            WHERE (toLower(coalesce(m.content, "")) CONTAINS toLower(topic)
+               OR toLower(coalesce(m.person_name, "")) = toLower(topic)
+               OR any(p IN coalesce(m.participants, []) WHERE toLower(p) = toLower(topic)))
+              AND NOT coalesce(m.superseded, false)
+
+            OPTIONAL MATCH (m)-[r]-(connected)
+
+            RETURN
                 topic,
                 COUNT(DISTINCT m) as memory_count,
                 COLLECT(DISTINCT {
@@ -746,13 +749,14 @@ class MemoryRetrievalEngine:
             query = """
             WITH $topics as topics
             UNWIND topics as topic
-            
+
             MATCH (m)
-            WHERE m.content CONTAINS topic
-               OR m.person_name = topic
-               OR topic IN m.participants
-            
-            RETURN 
+            WHERE (toLower(coalesce(m.content, "")) CONTAINS toLower(topic)
+               OR toLower(coalesce(m.person_name, "")) = toLower(topic)
+               OR any(p IN coalesce(m.participants, []) WHERE toLower(p) = toLower(topic)))
+              AND NOT coalesce(m.superseded, false)
+
+            RETURN
                 topic,
                 COUNT(DISTINCT m) as memory_count,
                 COLLECT(DISTINCT {
@@ -925,16 +929,18 @@ class MemoryRetrievalEngine:
             hubs = await engine.get_most_connected_memories(limit=5)
             ```
         """
-        topic_filter = self._build_topic_filter(topic, prefix="WHERE")
+        # prefix="AND" because the superseded guard already provides the WHERE clause
+        topic_filter = self._build_topic_filter(topic, prefix="AND")
         parameters = {'limit': limit}
-        
+
         if topic:
             parameters['topic'] = topic
-        
+
         query = f"""
-        MATCH (m)-[r:MEMORY_RELATIONSHIP]-(connected)
+        MATCH (m)-[r]-(connected)
+        WHERE NOT coalesce(m.superseded, false)
         {topic_filter}
-        RETURN 
+        RETURN
             m.id as id,
             m.content as content,
             labels(m) as type,
@@ -1210,7 +1216,7 @@ class MemoryRetrievalEngine:
         """
         query = f"""
         MATCH (root {{id: $memory_id}})
-        MATCH path = (root)-[r:MEMORY_RELATIONSHIP*1..{max_hops}]-(connected)
+        MATCH path = (root)-[r*1..{max_hops}]-(connected)
         
         WITH connected, 
              relationships(path) as rels,
@@ -1278,7 +1284,7 @@ class MemoryRetrievalEngine:
            OR toLower(coalesce(root.concept, "")) CONTAINS toLower($topic)
            OR any(p IN coalesce(root.participants, []) WHERE toLower(p) = toLower($topic))
         
-        MATCH (root)-[r:MEMORY_RELATIONSHIP]-(connected)
+        MATCH (root)-[r]-(connected)
         {strength_filter}
         
         WITH 
@@ -1337,7 +1343,7 @@ class MemoryRetrievalEngine:
             ```
         """
         query = """
-        MATCH (m1 {id: $from_id})-[r:MEMORY_RELATIONSHIP]-(m2 {id: $to_id})
+        MATCH (m1 {id: $from_id})-[r]-(m2 {id: $to_id})
         SET 
             r.strength = CASE 
                 WHEN r.strength + $boost <= 1.0 THEN r.strength + $boost
@@ -1461,7 +1467,7 @@ class MemoryRetrievalEngine:
         
         # Get relationship count
         query = """
-        MATCH ()-[r:MEMORY_RELATIONSHIP]->()
+        MATCH ()-[r]->()
         RETURN count(r) as relationship_count
         """
         rel_result = await self.client.execute_query(query)

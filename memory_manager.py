@@ -169,7 +169,7 @@ class MemoryManager:
                 username=self.config.neo4j_username,
                 password=self.config.neo4j_password,
                 database=self.config.database,
-                max_connection_pool_size=30,
+                max_connection_pool_size=self.config.neo4j_max_connection_pool_size,
             )
             await self.l2_client.connect()
             await self.l2_client.create_constraints_and_indexes()
@@ -367,6 +367,12 @@ class MemoryManager:
         """
         Called by WorkspaceWatcher when a proactive notification fires.
         Delegates to the injected callback if one was provided at construction.
+
+        This is the single canonical entry point for proactive notifications.
+        Pass a callback at construction time via on_proactive_notification=;
+        do NOT monkey-patch this method — the WorkspaceWatcher holds a direct
+        reference to it captured at setup() time, so a post-setup replacement
+        would be silently ignored.
         """
         observer.info(
             "proactive_notification",
@@ -376,13 +382,6 @@ class MemoryManager:
         )
         if self._proactive_callback is not None:
             self._proactive_callback(item)
-
-    def _on_proactive_notification(self, item) -> None:
-        """
-        Legacy entry point kept for callers that monkey-patch this method
-        directly. Prefer passing on_proactive_notification= to __init__.
-        """
-        self._dispatch_proactive_notification(item)
 
     # =========================================================================
     # HELPERS

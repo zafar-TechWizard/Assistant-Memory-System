@@ -62,6 +62,11 @@ class MemoryConfig:
     neo4j_http_port: int = 7474
     neo4j_bolt_port: int = 7687
 
+    # Connection pool
+    # Bolt driver maintains a persistent connection pool. 30 is generous for a
+    # single-user assistant; lower it (e.g. 10) if memory footprint matters.
+    neo4j_max_connection_pool_size: int = 30
+
     # Docker / Health Check
     neo4j_health_check_max_attempts: int = 60
     neo4j_health_check_interval: int = 1   # seconds between poll attempts

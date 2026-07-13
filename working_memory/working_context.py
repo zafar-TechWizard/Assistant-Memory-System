@@ -697,6 +697,7 @@ class WorkingContextManager:
             "energy_level":     s.energy_level,
             "emotional_tone":   s.emotional_tone,
             "current_focus":    s.current_focus,
+            "last_action":      s.last_action,
             "last_topics":      list(s.last_topics_discussed),
             "last_commitments": list(s.last_commitments),
             "last_questions":   list(s.last_questions_asked),
