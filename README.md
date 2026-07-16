@@ -143,7 +143,7 @@ async def main():
     ctx = manager.get_full_context()
 
     print(ctx.memory.must_know)          # ["prefers short answers", "building Python CLI"]
-    print(ctx.user.emotional_state)      # "focused"
+    print(ctx.user.current_emotional_state)      # "focused"
     print(ctx.assistant.time_of_day)     # "afternoon"
 
     await manager.shutdown()
@@ -264,7 +264,7 @@ ctx.assistant.last_topics_discussed
 ctx.assistant.last_commitments    # commitments made in the last response
 
 # About the user
-ctx.user.emotional_state          # inferred from message tone
+ctx.user.current_emotional_state          # inferred from message tone
 ctx.user.current_focus            # most recently mentioned entity
 ctx.user.mentioned_entities       # Set[str] — entities in this turn
 

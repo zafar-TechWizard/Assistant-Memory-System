@@ -40,7 +40,7 @@ async def main() -> None:
     print("=== Memory snapshot ===")
     print(f"Must-know memories : {ctx.memory.must_know}")
     print(f"Active entities    : {list(ctx.memory.retrieval_meta.__dict__)}")
-    print(f"User emotional state: {ctx.user.emotional_state}")
+    print(f"User emotional state: {ctx.user.current_emotional_state}")
     print(f"Assistant mode     : {ctx.assistant.current_mode}")
     print(f"Time of day        : {ctx.assistant.time_of_day}")
 
