@@ -585,6 +585,33 @@ class MemoryRetrievalEngine:
 
         return top
 
+    async def batch_get_superseded_predecessors(
+        self, node_ids: List[str]
+    ) -> Dict[str, Dict]:
+        """
+        For each node_id that is the *target* of a SUPERSEDED_BY edge, return
+        the predecessor's content.  Used by the digest layer to surface update
+        narratives in working context.
+
+        Returns: {new_node_id -> {"id": ..., "content": ...}}
+        """
+        if not node_ids:
+            return {}
+        query = """
+        MATCH (old)-[:SUPERSEDED_BY]->(new)
+        WHERE new.id IN $ids
+        RETURN new.id AS new_id, old.id AS old_id, old.content AS old_content
+        """
+        try:
+            rows = await self.client.execute_query(query, parameters={"ids": node_ids})
+        except Exception:
+            return {}
+        return {
+            row["new_id"]: {"id": row["old_id"], "content": row["old_content"]}
+            for row in (rows or [])
+            if row.get("new_id") and row.get("old_content")
+        }
+
     # ========================================================================
     # SEMANTIC SEARCH METHODS
     # ========================================================================

@@ -60,6 +60,7 @@ from enum import Enum
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from memory.long_term import reranker as _reranker
+from memory.long_term.memory_digest import apply_digest, build_relationship_profiles
 from memory.observability import observer
 
 # Optional: dateparser for named day-of-week parsing ("last Tuesday")
@@ -112,15 +113,17 @@ class RoutedMemories:
     context      — relevant background; high composite score
     associations — graph neighbours; loosely related; lowest priority
     emotional_baseline — emotion distribution summary (EMOTIONAL intent only)
+    relationship_profiles — aggregated person profiles keyed by person_name
     """
     intent: Intent
     confidence: float
-    must_know: List[Dict]    = field(default_factory=list)
-    context: List[Dict]      = field(default_factory=list)
-    associations: List[Dict] = field(default_factory=list)
-    emotional_baseline: Dict = field(default_factory=dict)
-    signals_fired: List[str] = field(default_factory=list)
-    latency_ms: float        = 0.0
+    must_know: List[Dict]              = field(default_factory=list)
+    context: List[Dict]                = field(default_factory=list)
+    associations: List[Dict]           = field(default_factory=list)
+    emotional_baseline: Dict           = field(default_factory=dict)
+    signals_fired: List[str]           = field(default_factory=list)
+    relationship_profiles: Dict        = field(default_factory=dict)
+    latency_ms: float                  = 0.0
 
     def flat_memories(self) -> List[Dict]:
         """Flat ordered list: must_know first, then context, then associations."""
@@ -602,6 +605,16 @@ class MemoryRouter:
         if self._last_confidence_threshold < 0.4:
             signals.append(f"confidence_relaxed_to_{self._last_confidence_threshold:.1f}")
 
+        # ── Digest enrichment ─────────────────────────────────────────────────
+        must_know_ids = [str(m["id"]) for m in must_know if m.get("id")]
+        supersession_map = await self._engine.batch_get_superseded_predecessors(must_know_ids)
+
+        apply_digest(must_know, supersession_map=supersession_map)
+        apply_digest(context)
+        apply_digest(associations)
+
+        relationship_profiles = build_relationship_profiles(must_know, context, associations)
+
         return RoutedMemories(
             intent=ir.primary_intent,
             confidence=ir.confidence,
@@ -610,6 +623,7 @@ class MemoryRouter:
             associations=associations,
             emotional_baseline=emotional_baseline,
             signals_fired=signals,
+            relationship_profiles=relationship_profiles,
             latency_ms=ms,
         )
 

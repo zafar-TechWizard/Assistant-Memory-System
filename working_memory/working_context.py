@@ -67,17 +67,22 @@ class MemoryState:
     """
     Everything the assistant knows from memory at this moment.
 
-    must_know    — directly answers the current query (coverage-verified)
-    context      — relevant background
-    associations — graph neighbours, loosely related
-    recent_turns — last N conversation turns from ConversationLogger
+    must_know             — directly answers the current query (coverage-verified)
+    context               — relevant background
+    associations          — graph neighbours, loosely related
+    relationship_profiles — person profiles keyed by name, aggregated from all tiers
+    retrieval_status      — {"status": "ready"|"retrieving", "message": str}
+
+    Note: recent_turns removed — conversation history is now owned by
+    ConversationManager in brain.py (BRAIN/history/conversation_manager.py).
     """
-    must_know:    List[Dict] = field(default_factory=list)
-    context:      List[Dict] = field(default_factory=list)
-    associations: List[Dict] = field(default_factory=list)
-    recent_turns: List[ConversationTurn] = field(default_factory=list)
-    retrieval_meta: RetrievalMeta = field(default_factory=RetrievalMeta)
-    emotional_baseline: Dict = field(default_factory=dict)
+    must_know:             List[Dict] = field(default_factory=list)
+    context:               List[Dict] = field(default_factory=list)
+    associations:          List[Dict] = field(default_factory=list)
+    retrieval_meta:        RetrievalMeta = field(default_factory=RetrievalMeta)
+    emotional_baseline:    Dict = field(default_factory=dict)
+    relationship_profiles: Dict = field(default_factory=dict)
+    retrieval_status:      Dict = field(default_factory=lambda: {"status": "ready", "message": ""})
 
     def flat_memories(self) -> List[Dict]:
         """All memories ordered by tier: must_know first."""
@@ -547,12 +552,13 @@ class WorkingContextManager:
 
     def update_memory(
         self,
-        must_know: Optional[List[Dict]]          = None,
-        context:   Optional[List[Dict]]          = None,
-        associations: Optional[List[Dict]]       = None,
-        recent_turns: Optional[List[ConversationTurn]] = None,
-        retrieval_meta: Optional[Dict]           = None,
-        emotional_baseline: Optional[Dict]       = None,
+        must_know:             Optional[List[Dict]]           = None,
+        context:               Optional[List[Dict]]           = None,
+        associations:          Optional[List[Dict]]           = None,
+        retrieval_meta:        Optional[Dict]                 = None,
+        emotional_baseline:    Optional[Dict]                 = None,
+        relationship_profiles: Optional[Dict]                 = None,
+        retrieval_status:      Optional[Dict]                 = None,
     ) -> None:
         """
         Update the MemoryState pillar.
@@ -560,10 +566,11 @@ class WorkingContextManager:
         Any argument left as None keeps the existing value.
         """
         with self._lock:
-            if must_know    is not None: self._memory.must_know    = must_know
-            if context      is not None: self._memory.context      = context
-            if associations is not None: self._memory.associations = associations
-            if recent_turns is not None: self._memory.recent_turns = recent_turns
+            if must_know             is not None: self._memory.must_know             = must_know
+            if context               is not None: self._memory.context               = context
+            if associations          is not None: self._memory.associations          = associations
+            if relationship_profiles is not None: self._memory.relationship_profiles = relationship_profiles
+            if retrieval_status      is not None: self._memory.retrieval_status      = retrieval_status
             if emotional_baseline is not None:
                 self._memory.emotional_baseline = emotional_baseline
             if retrieval_meta is not None:

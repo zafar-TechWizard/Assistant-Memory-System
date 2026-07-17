@@ -48,13 +48,11 @@ from memory.config import config
 # Renamed to avoid collision with the new centralized WorkingContextManager
 from memory.working_memory.context_manager import WorkingContextManager as DiskContextManager
 from memory.working_memory.ref_resolver import RefResolver
-from memory.working_memory.working_context import (
-    WorkingContextManager,
-    ConversationTurn,
-)
+from memory.working_memory.working_context import WorkingContextManager
 from memory.processing.conversationLogger import ConversationLogger
 from memory.processing.entity_extractor import EntityExtractor
 from memory.long_term.memory_router import RoutedMemories
+from memory.long_term.memory_digest import apply_digest, build_relationship_profiles
 from memory.observability import observer, summarize_working_context
 
 
@@ -135,6 +133,8 @@ class WorkingMemory:
                 "context":      [],   # relevant background
                 "associations": [],   # graph neighbours, loosely related
             },
+            "relationship_profiles": {},  # keyed by person_name; set by digest layer
+            "retrieval_status": {"status": "ready", "message": ""},
             # ── Retrieval metadata ────────────────────────────────────────────
             "retrieval_meta": {
                 "intent":       None,
@@ -149,6 +149,10 @@ class WorkingMemory:
         # Set when idle/done, clear when reactive_processing is running.
         self._processing_done = threading.Event()
         self._processing_done.set()  # nothing in-flight at startup
+        # Monotonic counter: incremented at the start of every reactive_processing
+        # call so late-arriving background results from a timed-out turn do not
+        # overwrite a newer turn's working context.
+        self._turn_seq: int = 0
 
         # ── Persistence (crash recovery only — NO polling) ────────────────────
         cfg_file = context_file or config.context_file_path
@@ -209,6 +213,9 @@ class WorkingMemory:
             role:    "user" | "assistant" | "system"
             content: Raw message text.
         """
+        with self._state_lock:
+            self._turn_seq += 1
+            my_seq = self._turn_seq
         self._processing_done.clear()
         t0 = time.perf_counter()
 
@@ -295,7 +302,8 @@ class WorkingMemory:
                 }, ms=(time.perf_counter() - t_intent) * 1000)
 
             # ── 5. LTM retrieval — router or fallback ─────────────────────────
-            routed = None  # captured so we can update context_manager outside the branch
+            routed = None           # captured so we can update context_manager outside the branch
+            fallback_memories = None  # set by direct-retrieval paths; carries digested results
             if _non_ambient and self._loop:
                 entities_list = list(entities)
                 _intent_val = _ir.primary_intent.value
@@ -331,19 +339,22 @@ class WorkingMemory:
                                         idx % len(entities_list)
                                     ]
                         with self._state_lock:
-                            self._state["tiered_memories"]["must_know"]    = routed.must_know
-                            self._state["tiered_memories"]["context"]      = routed.context
-                            self._state["tiered_memories"]["associations"] = routed.associations
-                            self._state["memories"] = self._merge_memories(
-                                self._state["memories"], flat_new
-                            )
-                            self._state["retrieval_meta"] = {
-                                "intent":        routed.intent.value,
-                                "confidence":    routed.confidence,
-                                "signals_fired": routed.signals_fired,
-                                "latency_ms":    routed.latency_ms,
-                            }
-                            self._state["emotional_baseline"] = routed.emotional_baseline
+                            if self._turn_seq == my_seq:
+                                self._state["tiered_memories"]["must_know"]    = routed.must_know
+                                self._state["tiered_memories"]["context"]      = routed.context
+                                self._state["tiered_memories"]["associations"] = routed.associations
+                                self._state["memories"] = self._merge_memories(
+                                    self._state["memories"], flat_new
+                                )
+                                self._state["retrieval_meta"] = {
+                                    "intent":        routed.intent.value,
+                                    "confidence":    routed.confidence,
+                                    "signals_fired": routed.signals_fired,
+                                    "latency_ms":    routed.latency_ms,
+                                }
+                                self._state["emotional_baseline"]    = routed.emotional_baseline
+                                self._state["relationship_profiles"] = routed.relationship_profiles
+                                self._state["retrieval_status"]      = {"status": "ready", "message": ""}
 
                         observer.stage("router_result", {
                             "intent":          routed.intent.value,
@@ -356,72 +367,71 @@ class WorkingMemory:
                     elif new_entities:
                         # Router returned None (timeout/error) — fallback to direct retrieval
                         fetched = self._fetch_from_longterm(new_entities)
+                        if fetched:
+                            apply_digest(fetched)
+                            fallback_memories = fetched
                         observer.stage("router_fallback", {
                             "reason": "router_none",
                             "memories_fetched": len(fetched),
                         })
                         with self._state_lock:
-                            self._state["memories"] = self._merge_memories(
-                                self._state["memories"], fetched
-                            )
+                            if self._turn_seq == my_seq:
+                                self._state["memories"] = self._merge_memories(
+                                    self._state["memories"], fetched
+                                )
+                                if fetched:
+                                    self._state["tiered_memories"]["must_know"] = fetched
+                                    self._state["retrieval_status"] = {"status": "ready", "message": ""}
 
             elif new_entities and self._loop:
                 # No router configured — direct retrieval for new entities only
                 fetched = self._fetch_from_longterm(new_entities)
+                if fetched:
+                    apply_digest(fetched)
+                    fallback_memories = fetched
                 observer.stage("direct_retrieval", {
                     "memories_fetched": len(fetched),
                 })
                 with self._state_lock:
-                    self._state["memories"] = self._merge_memories(
-                        self._state["memories"], fetched
-                    )
+                    if self._turn_seq == my_seq:
+                        self._state["memories"] = self._merge_memories(
+                            self._state["memories"], fetched
+                        )
+                        if fetched:
+                            self._state["tiered_memories"]["must_know"] = fetched
+                            self._state["retrieval_status"] = {"status": "ready", "message": ""}
 
-            # ── 6. Log conversation SYNCHRONOUSLY before reading back ─────────
-            # Logging used to be fire-and-forget at the very end, which raced
-            # with the recent_turns read below — the current turn often hadn't
-            # been written to disk yet. Logging here (after retrieval, before
-            # the WorkingContext update) is the simplest reliable fix.
+            # ── 6. Log conversation turn ──────────────────────────────────────
+            # Write-only. Conversation history is now owned by ConversationManager
+            # in brain.py — no read-back needed here.
             self._safe_log(role, content)
 
-            # ── 7. ALWAYS push to WorkingContextManager (regardless of intent path) ──
-            # This is what populates WorkingContext.memory.recent_turns. Used to
-            # live inside the `if routed is not None:` branch, which meant
-            # AMBIENT / familiarity-hit / router-timeout turns never refreshed
-            # the conversation history surfaced to the brain layer.
+            # ── 7. Push retrieved memories to WorkingContextManager ───────────
             if self._ctx_mgr:
-                try:
-                    raw_turns = self.conversation_logger.get_conversation_history(
-                        max_turns=config.working_context_recent_turns * 2
-                    )
-                    recent_turns = [
-                        ConversationTurn(
-                            role=t["role"],
-                            content=t["content"],
-                            timestamp=datetime.fromisoformat(
-                                t["timestamp"].replace("Z", "")
-                            ),
-                        )
-                        for t in (raw_turns or [])[-config.working_context_recent_turns:]
-                    ]
-                except Exception as exc:
-                    observer.warning("recent_turns read failed", error=str(exc))
-                    recent_turns = []
-
-                update_kwargs: Dict[str, Any] = {"recent_turns": recent_turns}
-                if routed is not None:
+                update_kwargs: Dict[str, Any] = {}
+                if routed is not None and self._turn_seq == my_seq:
                     update_kwargs.update({
-                        "must_know":          routed.must_know,
-                        "context":            routed.context,
-                        "associations":       routed.associations,
+                        "must_know":             routed.must_know,
+                        "context":               routed.context,
+                        "associations":          routed.associations,
                         "retrieval_meta": {
                             "intent":        routed.intent.value,
                             "confidence":    routed.confidence,
                             "signals_fired": routed.signals_fired,
                             "latency_ms":    routed.latency_ms,
                         },
-                        "emotional_baseline": routed.emotional_baseline,
+                        "emotional_baseline":    routed.emotional_baseline,
+                        "relationship_profiles": routed.relationship_profiles,
+                        "retrieval_status":      {"status": "ready", "message": ""},
                     })
-                self._ctx_mgr.update_memory(**update_kwargs)
+                elif fallback_memories and self._turn_seq == my_seq:
+                    update_kwargs.update({
+                        "must_know":             fallback_memories,
+                        "relationship_profiles": build_relationship_profiles(fallback_memories, [], []),
+                        "retrieval_status":      {"status": "ready", "message": ""},
+                    })
+                if update_kwargs:
+                    self._ctx_mgr.update_memory(**update_kwargs)
 
                 focus_entities = list(entities) if entities else list(new_entities)
                 self._ctx_mgr.update_user_state(
@@ -477,27 +487,40 @@ class WorkingMemory:
             }
         """
         completed = self._processing_done.wait(timeout=self._timeout_s)
-        if not completed:
-            observer.warning(
-                "get_working_context timeout — returning partial",
-                timeout_ms=int(self._timeout_s * 1000),
-            )
 
         with self._state_lock:
+            if not completed:
+                observer.warning(
+                    "get_working_context timeout — returning partial",
+                    timeout_ms=int(self._timeout_s * 1000),
+                )
+                # Background retrieval continues; it will update state when it
+                # finishes (turn_seq guard prevents it overwriting a newer turn).
+                self._state["retrieval_status"] = {
+                    "status":  "retrieving",
+                    "message": (
+                        "Memory retrieval is still in progress. "
+                        "I may recall more detail in the next exchange — "
+                        "consider asking me to reflect if something seems incomplete."
+                    ),
+                }
+
             if self._auto_cleanup:
                 self._prune_expired_entities()
 
             return {
-                "active_entities":    dict(self._state["active_entities"]),
-                "current_entities":   list(self._state["current_entities"]),
-                "memories":           list(self._state["memories"]),
-                "tiered_memories":    {
+                "active_entities":       dict(self._state["active_entities"]),
+                "current_entities":      list(self._state["current_entities"]),
+                "memories":              list(self._state["memories"]),
+                "tiered_memories":       {
                     "must_know":    list(self._state["tiered_memories"]["must_know"]),
                     "context":      list(self._state["tiered_memories"]["context"]),
                     "associations": list(self._state["tiered_memories"]["associations"]),
                 },
-                "retrieval_meta":     dict(self._state["retrieval_meta"]),
-                "emotional_baseline": dict(self._state["emotional_baseline"]),
+                "relationship_profiles": dict(self._state["relationship_profiles"]),
+                "retrieval_status":      dict(self._state["retrieval_status"]),
+                "retrieval_meta":        dict(self._state["retrieval_meta"]),
+                "emotional_baseline":    dict(self._state["emotional_baseline"]),
             }
 
     def shutdown(self) -> None:
@@ -757,13 +780,15 @@ class WorkingMemory:
         """
         try:
             with self._state_lock:
-                active_entities  = dict(self._state["active_entities"])
-                current_entities = list(self._state["current_entities"])
-                must_know        = list(self._state["tiered_memories"]["must_know"])
-                context_items    = list(self._state["tiered_memories"]["context"])
-                assoc_items      = list(self._state["tiered_memories"]["associations"])
-                retrieval_meta   = dict(self._state["retrieval_meta"])
-                emotional_base   = dict(self._state["emotional_baseline"])
+                active_entities       = dict(self._state["active_entities"])
+                current_entities      = list(self._state["current_entities"])
+                must_know             = list(self._state["tiered_memories"]["must_know"])
+                context_items         = list(self._state["tiered_memories"]["context"])
+                assoc_items           = list(self._state["tiered_memories"]["associations"])
+                retrieval_meta        = dict(self._state["retrieval_meta"])
+                emotional_base        = dict(self._state["emotional_baseline"])
+                relationship_profiles = dict(self._state.get("relationship_profiles", {}))
+                retrieval_status      = dict(self._state.get("retrieval_status", {"status": "ready", "message": ""}))
 
             # Write large tiers to sidecar files (always, even if empty —
             # so the $ref is always a valid pointer and readers never KeyError).
@@ -784,7 +809,9 @@ class WorkingMemory:
                 "signals_fired":     retrieval_meta.get("signals_fired", []),
                 "active_entities":   active_entities,
                 "current_entities":  current_entities,
-                "emotional_baseline":emotional_base,
+                "emotional_baseline":   emotional_base,
+                "relationship_profiles": relationship_profiles,
+                "retrieval_status":      retrieval_status,
                 "tiers": {
                     "must_know": {
                         "count": len(must_know),
