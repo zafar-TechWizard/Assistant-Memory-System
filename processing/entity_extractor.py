@@ -675,9 +675,9 @@ class EntityExtractor:
                     }
                 )
                 entities.append(entity)
-        
-        return self._deduplicate_entities(entities)
-    
+
+        return entities
+
     def _extract_with_heuristics(self, text: str) -> List[Entity]:
         """
         Fallback heuristic extraction when spaCy unavailable.
@@ -931,7 +931,7 @@ def create_entity_extractor(
 ) -> EntityExtractor:
     """
     Factory function to create EntityExtractor from config.
-    
+
     Args:
         config: Configuration dictionary with keys:
             - spacy_model: str
@@ -939,22 +939,28 @@ def create_entity_extractor(
             - enable_caching: bool
             - strict_spacy: bool
             - confidence_threshold: float
-    
+            - use_gliner: bool (default True)
+            - gliner_model: str (default "urchade/gliner_medium-v2.1")
+            - use_coreferee: bool (default True)
+
     Returns:
         Initialized EntityExtractor instance
-        
+
     Example:
         >>> extractor = create_entity_extractor(config)
     """
     if config is None:
         config = {}
-    
+
     return EntityExtractor(
         spacy_model=config.get('spacy_model', 'en_core_web_sm'),
         custom_patterns=config.get('custom_patterns', []),
         enable_caching=config.get('enable_caching', True),
         strict_spacy=config.get('strict_spacy', False),
-        confidence_threshold=config.get('confidence_threshold', 0.5)
+        confidence_threshold=config.get('confidence_threshold', 0.5),
+        use_gliner=config.get('use_gliner', True),
+        gliner_model=config.get('gliner_model', 'urchade/gliner_medium-v2.1'),
+        use_coreferee=config.get('use_coreferee', True),
     )
 
 
