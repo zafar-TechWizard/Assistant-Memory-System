@@ -31,20 +31,11 @@ class MemoryRelationshipType(str, Enum):
     KNOWLEDGE_TO_RELATIONSHIP = "KNOWLEDGE_TO_RELATIONSHIP"  # Knowledge about person
     RELATIONSHIP_TO_KNOWLEDGE = "RELATIONSHIP_TO_KNOWLEDGE"  # Person has knowledge
     
-    # REFACTOR: Removed all 'CURRENT' relationships
-    # CURRENT_TO_EXPERIENCE = "CURRENT_TO_EXPERIENCE"
-    # EXPERIENCE_TO_CURRENT = "EXPERIENCE_TO_CURRENT"
-    # CURRENT_TO_KNOWLEDGE = "CURRENT_TO_KNOWLEDGE"
-    # KNOWLEDGE_TO_CURRENT = "KNOWLEDGE_TO_CURRENT"
-    # CURRENT_TO_RELATIONSHIP = "CURRENT_TO_RELATIONSHIP"
-    # RELATIONSHIP_TO_CURRENT = "RELATIONSHIP_TO_CURRENT"
-    
     # Within-context relationships
     EXPERIENCE_CHAIN = "EXPERIENCE_CHAIN"  # One experience led to another
     KNOWLEDGE_HIERARCHY = "KNOWLEDGE_HIERARCHY"  # Knowledge builds on other knowledge
     RELATIONSHIP_NETWORK = "RELATIONSHIP_NETWORK"  # People know each other
-    # REFACTOR: Removed 'CURRENT_SEQUENCE'
-    
+
     # Temporal relationships
     HAPPENED_BEFORE = "HAPPENED_BEFORE"
     HAPPENED_AFTER = "HAPPENED_AFTER"
@@ -136,12 +127,6 @@ class MemoryRelationshipEdge(BaseModel):
             raise ValueError('Confidence must be between 0.0 and 1.0')
         return v
     
-    # @root_validator
-    # def update_reinforcement_timestamp(cls, values):
-    #     """Update last_reinforced timestamp when relationship is modified"""
-    #     if 'last_reinforced' in values:
-    #         values['last_reinforced'] = datetime.now()
-    #     return values
 
 
 # Memory relationship type mappings for easy access
@@ -153,13 +138,11 @@ MEMORY_RELATIONSHIP_TYPE_MAPPING = {
         MemoryRelationshipType.RELATIONSHIP_TO_EXPERIENCE,
         MemoryRelationshipType.KNOWLEDGE_TO_RELATIONSHIP,
         MemoryRelationshipType.RELATIONSHIP_TO_KNOWLEDGE,
-        # REFACTOR: Removed all 'CURRENT' relationships
     ],
     MemoryRelationshipCategory.WITHIN_CONTEXT: [
         MemoryRelationshipType.EXPERIENCE_CHAIN,
         MemoryRelationshipType.KNOWLEDGE_HIERARCHY,
         MemoryRelationshipType.RELATIONSHIP_NETWORK,
-        # REFACTOR: Removed 'CURRENT_SEQUENCE'
     ],
     MemoryRelationshipCategory.TEMPORAL: [
         MemoryRelationshipType.HAPPENED_BEFORE,
@@ -181,5 +164,3 @@ MEMORY_RELATIONSHIP_TYPE_MAPPING = {
     ]
 }
 
-# Alias for backward compatibility
-RelationshipTypes = MemoryRelationshipType

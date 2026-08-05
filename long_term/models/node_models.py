@@ -29,7 +29,6 @@ class MemoryContext(str, Enum):
     EXPERIENCE = "EXPERIENCE"  # What happened to me + what I learned from it
     KNOWLEDGE = "KNOWLEDGE"    # What I know + how I use it
     RELATIONSHIP = "RELATIONSHIP"  # Who I know + how I feel + how we interact
-    # REFACTOR: Removed 'CURRENT' context to solve Gap #5
 
 
 class BaseMemoryNode(BaseModel):
@@ -42,8 +41,6 @@ class BaseMemoryNode(BaseModel):
     memory_context: MemoryContext = Field(description="Context this memory belongs to")
     content: str = Field(description="The actual memory content")
     
-    # --- NEW: Add content_vector field ---
-    # This field is required for the vector index.
     content_vector: Optional[List[float]] = Field(None, description="Vector embedding of the content")
     
     description: Optional[str] = Field(None, description="Detailed description of the memory")
@@ -72,18 +69,6 @@ class BaseMemoryNode(BaseModel):
         # Allow extra fields (like content_vector) to be pruned if not defined in a child
         extra = "ignore" 
     
-    # @validator('content')
-    # def content_must_not_be_empty(cls, v):
-    #     if not v or not v.strip():
-    #         raise ValueError('Content cannot be empty')
-    #     return v.strip()
-    
-    # @root_validator
-    # def update_timestamp_on_change(cls, values):
-    #     """Update last_updated timestamp when memory is modified"""
-    #     if 'last_updated' in values:
-    #         values['last_updated'] = datetime.now()
-    #     return values
 
 
 class ExperienceMemoryNode(BaseMemoryNode):
@@ -114,7 +99,6 @@ class ExperienceMemoryNode(BaseMemoryNode):
     # Context Relevance (how relevant this experience is to other contexts)
     knowledge_relevance: float = Field(default=0.5, ge=0.0, le=1.0, description="How relevant this is to knowledge context")
     relationship_relevance: float = Field(default=0.5, ge=0.0, le=1.0, description="How relevant this is to relationship context")
-    # REFACTOR: Removed 'current_relevance'
     
     @validator('event_type')
     def validate_event_type(cls, v):
@@ -159,7 +143,6 @@ class KnowledgeMemoryNode(BaseMemoryNode):
     # Context Relevance
     experience_relevance: float = Field(default=0.5, ge=0.0, le=1.0, description="How relevant this is to experience context")
     relationship_relevance: float = Field(default=0.5, ge=0.0, le=1.0, description="How relevant this is to relationship context")
-    # REFACTOR: Removed 'current_relevance'
     
     @validator('category')
     def validate_category(cls, v):
@@ -209,7 +192,6 @@ class RelationshipMemoryNode(BaseMemoryNode):
     # Context Relevance
     experience_relevance: float = Field(default=0.5, ge=0.0, le=1.0, description="How relevant this is to experience context")
     knowledge_relevance: float = Field(default=0.5, ge=0.0, le=1.0, description="How relevant this is to knowledge context")
-    # REFACTOR: Removed 'current_relevance'
     
     @validator('relationship_type')
     def validate_relationship_type(cls, v):
@@ -222,5 +204,3 @@ class RelationshipMemoryNode(BaseMemoryNode):
         return v
 
 
-# REFACTOR: Removed the entire CurrentMemoryNode class
-# (This class is redundant per Gap #5. L1's WorkingMemory class serves this role.)
